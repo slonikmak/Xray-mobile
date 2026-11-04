@@ -35,7 +35,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 @Composable
-fun XrayApp(app: SubscriptionApp, vpn: VpnSession?, onConnect: (Profile) -> Unit) {
+fun XrayApp(app: SubscriptionApp, vpn: VpnSession?, onConnect: (Profile) -> Unit, onStop: () -> Unit) {
     val state by app.state.collectAsState()
     val vpnState = vpn?.state?.collectAsState()?.value ?: VpnState()
     val scope = rememberCoroutineScope()
@@ -73,7 +73,7 @@ fun XrayApp(app: SubscriptionApp, vpn: VpnSession?, onConnect: (Profile) -> Unit
                 },
             ) { padding ->
                 if (connectScreen) ConnectScreen(state, vpnState, vpn != null, Modifier.padding(padding),
-                    onChoose = { connectScreen = false }, onConnect = onConnect, onStop = { vpn?.stop() })
+                    onChoose = { connectScreen = false }, onConnect = onConnect, onStop = onStop)
                 else ProfilesScreen(state, vpnState, Modifier.padding(padding),
                     onSelect = { link -> scope.launch { app.select(link) } },
                     onRefresh = { load(state.url, false) }, onCancel = { loadJob?.cancel() })
@@ -184,12 +184,12 @@ private fun ConnectScreen(subscription: SubscriptionState, vpn: VpnState, availa
         CheckPhase.NOT_CHECKED -> "Не проверено"
         CheckPhase.CHECKING -> "Проверяется"
         CheckPhase.SUCCEEDED -> "Доступен"
-        CheckPhase.FAILED -> "Недоступен"
+        CheckPhase.FAILED -> "Ошибка проверки"
     }
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(24.dp)) {
         Surface(color = Color(0xFF151C25), shape = RoundedCornerShape(50), border = BorderStroke(1.dp, Border)) {
-            Text("●  $phaseText", color = if (active) Accent else Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp))
+            Text("●  $phaseText", color = if (active) Accent else if (vpn.phase == VpnPhase.ERROR) Danger else Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp))
         }
         if (profile != null) {
             ProfileRow(profile, selected = true, loading = false, onSelect = { onChoose() },

@@ -140,6 +140,25 @@ class VpnSessionTest {
         assertEquals("Разрешение отозвано", session.state.value.error)
         assertEquals(false, adapter.started)
     }
+
+    @Test
+    fun restoredTerminalErrorRemainsVisibleUntilUserStartsAgain() = runTest {
+        val session = VpnSession(FakeVpnAdapter(), backgroundScope, "VPN остановился")
+        assertEquals(VpnPhase.ERROR, session.state.value.phase)
+        assertEquals("VPN остановился", session.state.value.error)
+        session.connect(Profile("Example", "synthetic"))
+        assertEquals(VpnPhase.PERMISSION, session.state.value.phase)
+        assertEquals(null, session.state.value.error)
+    }
+
+    @Test
+    fun restoredCleanupFailureBlocksConnectionUntilRetried() = runTest {
+        val session = VpnSession(FakeVpnAdapter(), backgroundScope, "Ошибка остановки", initialCleanupRequired = true)
+        assertFalse(session.connect(Profile("Example", "synthetic")))
+        session.stop()
+        runCurrent()
+        assertEquals(VpnPhase.DISCONNECTED, session.state.value.phase)
+    }
 }
 
 private class FakeVpnAdapter : VpnAdapter {

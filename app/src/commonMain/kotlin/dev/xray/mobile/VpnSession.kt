@@ -25,8 +25,9 @@ interface VpnAdapter {
     suspend fun check(): Boolean
 }
 
-class VpnSession(private val adapter: VpnAdapter, private val scope: CoroutineScope) {
-    private val mutableState = MutableStateFlow(VpnState())
+class VpnSession(private val adapter: VpnAdapter, private val scope: CoroutineScope, initialError: String? = null, initialCleanupRequired: Boolean = false) {
+    private val mutableState = MutableStateFlow(if (initialError == null && !initialCleanupRequired) VpnState() else
+        VpnState(phase = VpnPhase.ERROR, error = initialError, cleanupRequired = initialCleanupRequired))
     val state = mutableState.asStateFlow()
     private var startJob: Job? = null
     private var checkJob: Job? = null

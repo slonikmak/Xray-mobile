@@ -20,10 +20,12 @@ class MainActivity : ComponentActivity() {
     private var vpnService: XrayVpnService? = null
     private val vpnSession = mutableStateOf<VpnSession?>(null)
     private var bound = false
+    private var pendingPermissionResult: Boolean? = null
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             vpnService = (binder as XrayVpnService.LocalBinder).service
             vpnSession.value = vpnService?.session
+            pendingPermissionResult?.let { result -> pendingPermissionResult = null; handlePermission(result) }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             vpnService = null
@@ -31,14 +33,14 @@ class MainActivity : ComponentActivity() {
         }
     }
     private val permission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        if (vpnService?.session?.state?.value?.phase == VpnPhase.PERMISSION) {
-            if (result.resultCode == Activity.RESULT_OK) startAuthorizedVpn()
-            else vpnService?.session?.permissionResult(false)
-        }
+        handlePermission(result.resultCode == Activity.RESULT_OK)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState?.containsKey("vpnPermissionResult") == true) {
+            pendingPermissionResult = savedInstanceState.getBoolean("vpnPermissionResult")
+        }
         window.statusBarColor = android.graphics.Color.rgb(13, 17, 24)
         window.navigationBarColor = android.graphics.Color.rgb(16, 22, 30)
         val engine = OkHttp.create {
@@ -47,25 +49,31 @@ class MainActivity : ComponentActivity() {
         }
         val app = SubscriptionApp(HttpSubscriptionSource(engine), AndroidSubscriptionStorage())
         bound = bindService(Intent(this, XrayVpnService::class.java), connection, Context.BIND_AUTO_CREATE)
-        setContent { XrayApp(app, vpnSession.value, ::requestVpn) }
+        setContent { XrayApp(app, vpnSession.value, ::requestVpn) { vpnService?.cancelOrStop() } }
     }
 
     private fun requestVpn(profile: Profile) {
-        val session = vpnService?.session ?: return
-        if (!session.connect(profile)) return
-        val intent = VpnService.prepare(this)
-        if (intent == null) startAuthorizedVpn() else permission.launch(intent)
-    }
-
-    private fun startAuthorizedVpn() {
-        val session = vpnService?.session ?: return
-        if (session.state.value.phase != VpnPhase.PERMISSION) return
+        val service = vpnService ?: return
+        if (!service.requestConnection(profile)) return
         try {
             startForegroundService(Intent(this, XrayVpnService::class.java))
-            session.permissionResult(true)
+            val intent = VpnService.prepare(this)
+            if (intent == null) handlePermission(true) else permission.launch(intent)
         } catch (_: Exception) {
-            session.terminated("Не удалось запустить VPN-сервис.")
+            service.failPending("Не удалось запросить разрешение VPN.")
         }
+    }
+
+    private fun handlePermission(granted: Boolean) {
+        val service = vpnService
+        if (service == null) { pendingPermissionResult = granted; return }
+        if (service.session.state.value.phase != VpnPhase.PERMISSION) return
+        if (granted) service.session.permissionResult(true) else service.permissionDenied()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        pendingPermissionResult?.let { outState.putBoolean("vpnPermissionResult", it) }
+        super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {
