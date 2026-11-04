@@ -6,6 +6,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
@@ -211,5 +212,50 @@ class SubscriptionTest {
     fun responseAtTheSizeLimitIsAccepted() = runBlocking {
         val engine = MockEngine { respond("x".repeat(1_048_576), HttpStatusCode.OK) }
         assertEquals(1_048_576, HttpSubscriptionSource(engine).fetch("https://example.test/subscription").length)
+    }
+
+    @Test
+    fun repeatedLoadIsIgnoredAndOriginalDownloadCanBeCancelled() = runTest {
+        val pending = CompletableDeferred<String>()
+        val app = SubscriptionApp(SubscriptionSource { pending.await() }, MemoryStorage())
+        val original = async { app.load("https://example.test/subscription") }
+        runCurrent()
+        assertEquals(false, app.load("https://example.test/other"))
+        assertEquals(true, app.state.value.loading)
+        original.cancel()
+        original.join()
+        assertEquals(false, app.state.value.loading)
+        assertEquals(emptyList(), app.state.value.profiles)
+    }
+
+    @Test
+    fun queryParameterOrderDoesNotLoseSelection() = runTest {
+        val first = "vless://00000000-0000-4000-8000-000000000000@example.test:443?type=xhttp&security=tls&path=%2Ftest#First"
+        val reordered = "vless://00000000-0000-4000-8000-000000000000@example.test:443?path=%2Ftest&security=tls&type=xhttp#Renamed"
+        var response = Base64.encode(first.encodeToByteArray())
+        val app = SubscriptionApp(SubscriptionSource { response }, MemoryStorage())
+        app.load("https://example.test/subscription")
+        app.select(first)
+        response = Base64.encode(reordered.encodeToByteArray())
+        app.load("https://example.test/subscription")
+        assertEquals(reordered, app.state.value.selectedLink)
+    }
+
+    @Test
+    fun invalidSubscriptionFormatHasSpecificError() = runTest {
+        val app = SubscriptionApp(SubscriptionSource { "not base64!" }, MemoryStorage())
+        app.load("https://example.test/subscription")
+        assertEquals("Неверный формат подписки.", app.state.value.error)
+    }
+
+    @Test
+    fun rejectsInvalidFingerprintAndMalformedExtra() = runTest {
+        val base = "vless://00000000-0000-4000-8000-000000000000@example.test:443?type=xhttp&security=tls"
+        val valid = "$base&extra=%7B%7D#Example"
+        val response = Base64.encode("$valid\n$base&fp=not-a-fingerprint\n$base&extra=not-json\n$base&extra=%7B%22scMaxBufferedPosts%22%3A%22bad%22%7D".encodeToByteArray())
+        val app = SubscriptionApp(SubscriptionSource { response }, MemoryStorage())
+        app.load("https://example.test/subscription")
+        assertEquals(listOf(valid), app.state.value.profiles.map { it.link })
+        assertEquals(3, app.state.value.skipped)
     }
 }

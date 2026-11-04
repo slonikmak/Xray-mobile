@@ -25,25 +25,13 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import dev.xray.mobile.resources.Res
-import dev.xray.mobile.resources.inter
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import org.jetbrains.compose.resources.Font
-
-private val Background = Color(0xFF0D1118)
-private val Surface = Color(0xFF141C25)
-private val Border = Color(0xFF25303B)
-private val Accent = Color(0xFF81EBCD)
-private val Text = Color(0xFFE9EEF2)
-private val Muted = Color(0xFF97A3B1)
-private val Danger = Color(0xFFC89494)
 
 @Composable
 fun XrayApp(app: SubscriptionApp) {
@@ -53,27 +41,16 @@ fun XrayApp(app: SubscriptionApp) {
     var connectScreen by remember { mutableStateOf(false) }
     var address by remember { mutableStateOf("") }
     var loadJob by remember { mutableStateOf<Job?>(null) }
-    val font = FontFamily(Font(Res.font.inter))
-    val typography = Typography().let {
-        it.copy(bodyLarge = it.bodyLarge.copy(fontFamily = font), bodyMedium = it.bodyMedium.copy(fontFamily = font),
-            bodySmall = it.bodySmall.copy(fontFamily = font), labelLarge = it.labelLarge.copy(fontFamily = font),
-            labelMedium = it.labelMedium.copy(fontFamily = font), labelSmall = it.labelSmall.copy(fontFamily = font))
-    }
-
     LaunchedEffect(app) { app.restore() }
 
     fun load(value: String, closeOnSuccess: Boolean) {
+        if (loadJob?.isActive == true) return
         loadJob = scope.launch {
-            app.load(value)
-            if (closeOnSuccess && app.state.value.error == null) importing = false
+            if (app.load(value) && closeOnSuccess) importing = false
         }
     }
 
-    MaterialTheme(
-        colorScheme = darkColorScheme(primary = Accent, background = Background, surface = Surface,
-            onSurface = Text, onBackground = Text, error = Danger),
-        typography = typography,
-    ) {
+    XrayTheme {
         if (importing) {
             ImportScreen(address, { address = it }, state, onBack = {
                 loadJob?.cancel()
@@ -128,7 +105,7 @@ private fun ProfilesScreen(state: SubscriptionState, modifier: Modifier, onSelec
 }
 
 @Composable
-private fun ProfileRow(profile: Profile, selected: Boolean, loading: Boolean, onSelect: (String) -> Unit) {
+internal fun ProfileRow(profile: Profile, selected: Boolean, loading: Boolean, onSelect: (String) -> Unit) {
     Surface(
         color = if (selected) Color(0xFF1B2B2D) else Surface,
         shape = RoundedCornerShape(12.dp),
@@ -209,7 +186,7 @@ private fun NavItem(icon: String, label: String, selected: Boolean, onClick: () 
 }
 
 @Composable
-private fun LineIcon(name: String, color: Color) {
+internal fun LineIcon(name: String, color: Color) {
     Canvas(Modifier.size(20.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
@@ -227,7 +204,7 @@ private fun LineIcon(name: String, color: Color) {
                     drawPath(top, color, style = stroke); drawPath(middle, color, style = stroke); drawPath(bottom, color, style = stroke)
                 }
                 else -> {
-                    drawArc(color, 45f, 270f, false, topLeft = Offset(4f, 4f), size = Size(16f, 16f), style = stroke)
+                    drawArc(color, -45f, 270f, false, topLeft = Offset(4f, 4f), size = Size(16f, 16f), style = stroke)
                     drawLine(color, Offset(12f, 2f), Offset(12f, 12f), strokeWidth = 1.8f, cap = StrokeCap.Round)
                 }
             }

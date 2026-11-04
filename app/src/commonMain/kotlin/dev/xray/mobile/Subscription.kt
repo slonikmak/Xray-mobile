@@ -9,6 +9,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
@@ -46,35 +47,43 @@ class SubscriptionApp(private val source: SubscriptionSource, private val storag
     }
 
     @OptIn(ExperimentalEncodingApi::class)
-    suspend fun load(url: String) {
-        if (state.value.loading) return
+    suspend fun load(url: String): Boolean {
+        if (state.value.loading) return false
         val previous = state.value.copy(loading = false, error = null)
         mutableState.value = previous.copy(loading = true)
-        try {
+        return try {
             val address = url.trim()
             if (!isHttpsAddress(address)) throw SubscriptionError("Введите корректный HTTPS URL подписки.")
             val encoded = source.fetch(address).filterNot { it.isWhitespace() }
-            val decoded = (if ('-' in encoded || '_' in encoded) Base64.UrlSafe else Base64).decode(encoded)
-                .decodeToString(throwOnInvalidSequence = true)
+            val decoded = try {
+                (if ('-' in encoded || '_' in encoded) Base64.UrlSafe else Base64).decode(encoded)
+                    .decodeToString(throwOnInvalidSequence = true)
+            } catch (_: Exception) {
+                throw SubscriptionError("Неверный формат подписки.")
+            }
             val lines = decoded.lines().map { it.trim() }.filter { it.isNotEmpty() }
-            val profiles = lines.mapNotNull(::parseProfile).distinctBy { it.link.substringBefore('#') }
+            val profiles = lines.mapNotNull(::parseProfile).distinctBy { profileIdentity(it.link) }
             if (profiles.isEmpty()) throw SubscriptionError("В подписке нет поддерживаемых профилей.")
             val next = SubscriptionState(url = address, profiles = profiles, skipped = lines.size - profiles.size,
                 selectedLink = previous.selectedLink?.let { selected ->
-                    profiles.firstOrNull { it.link.substringBefore('#') == selected.substringBefore('#') }?.link
+                    profiles.firstOrNull { profileIdentity(it.link) == profileIdentity(selected) }?.link
                 })
             currentCoroutineContext().ensureActive()
             storage.write(Json.encodeToString(next))
             mutableState.value = next
+            true
         } catch (e: TimeoutCancellationException) {
+            mutableState.value = previous
             currentCoroutineContext().ensureActive()
             mutableState.value = previous.copy(error = "Время загрузки подписки истекло. Попробуйте снова.")
+            false
         } catch (e: CancellationException) {
             mutableState.value = previous
             throw e
         } catch (e: Exception) {
             mutableState.value = previous.copy(error = (e as? SubscriptionError)?.message
                 ?: "Не удалось загрузить подписку. Проверьте ссылку и попробуйте снова.")
+            false
         }
     }
 
@@ -90,6 +99,13 @@ class SubscriptionApp(private val source: SubscriptionSource, private val storag
             mutableState.value = state.value.copy(error = "Не удалось сохранить выбор профиля.")
         }
     }
+}
+
+private data class ProfileIdentity(val user: String?, val host: String, val port: Int, val parameters: Map<String, List<String>>)
+
+private fun profileIdentity(link: String): ProfileIdentity {
+    val url = Url(link)
+    return ProfileIdentity(url.user, url.host.lowercase(), url.port, url.parameters.entries().associate { it.key to it.value })
 }
 
 class SubscriptionError(message: String) : Exception(message)
@@ -110,6 +126,11 @@ private fun parseProfile(link: String): Profile? {
     val params = url.parameters
     val uuid = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
     val allowed = setOf("type", "security", "encryption", "flow", "sni", "fp", "alpn", "host", "path", "mode", "extra", "pbk", "sid", "spx", "headerType")
+    val fingerprints = setOf("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "randomizednoalpn", "unsafe")
+    val fingerprintValid = params["fp"] == null || params["fp"] in fingerprints
+    val extraValid = params["extra"]?.let {
+        runCatching { (Json.parseToJsonElement(it) as? JsonObject)?.isEmpty() == true }.getOrDefault(false)
+    } ?: true
     val supported = when (params["type"] to params["security"]) {
         "xhttp" to "tls" -> params["flow"].isNullOrEmpty() &&
             params["mode"] in listOf(null, "auto", "packet-up", "stream-up", "stream-one") &&
@@ -124,8 +145,9 @@ private fun parseProfile(link: String): Profile? {
         }
         else -> false
     }
-    if (url.protocol.name != "vless" || url.host.isBlank() || url.port !in 1..65535 ||
+    if (url.protocol.name != "vless" || url.host.isBlank() || url.port !in 1..65535 || url.encodedPath !in listOf("", "/") ||
         !uuid.matches(url.user.orEmpty()) || !url.password.isNullOrEmpty() || !supported ||
+        !fingerprintValid || !extraValid ||
         params["encryption"]?.let { it != "none" } == true ||
         params.names().any { it !in allowed || params.getAll(it)?.size != 1 }) return null
     Profile(url.fragment.ifBlank { url.host }, link)
