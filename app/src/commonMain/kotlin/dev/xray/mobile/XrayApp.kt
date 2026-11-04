@@ -24,6 +24,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -34,11 +35,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 @Composable
-fun XrayApp(app: SubscriptionApp) {
+fun XrayApp(app: SubscriptionApp, vpn: VpnSession?, onConnect: (Profile) -> Unit) {
     val state by app.state.collectAsState()
+    val vpnState = vpn?.state?.collectAsState()?.value ?: VpnState()
     val scope = rememberCoroutineScope()
     var importing by remember { mutableStateOf(false) }
-    var connectScreen by remember { mutableStateOf(false) }
+    var connectScreen by remember { mutableStateOf(true) }
     var address by remember { mutableStateOf("") }
     var loadJob by remember { mutableStateOf<Job?>(null) }
     LaunchedEffect(app) { app.restore() }
@@ -70,8 +72,9 @@ fun XrayApp(app: SubscriptionApp) {
                     }
                 },
             ) { padding ->
-                if (connectScreen) ConnectPlaceholder(state, Modifier.padding(padding))
-                else ProfilesScreen(state, Modifier.padding(padding),
+                if (connectScreen) ConnectScreen(state, vpnState, vpn != null, Modifier.padding(padding),
+                    onChoose = { connectScreen = false }, onConnect = onConnect, onStop = { vpn?.stop() })
+                else ProfilesScreen(state, vpnState, Modifier.padding(padding),
                     onSelect = { link -> scope.launch { app.select(link) } },
                     onRefresh = { load(state.url, false) }, onCancel = { loadJob?.cancel() })
             }
@@ -80,7 +83,8 @@ fun XrayApp(app: SubscriptionApp) {
 }
 
 @Composable
-private fun ProfilesScreen(state: SubscriptionState, modifier: Modifier, onSelect: (String) -> Unit, onRefresh: () -> Unit, onCancel: () -> Unit) {
+private fun ProfilesScreen(state: SubscriptionState, vpn: VpnState, modifier: Modifier, onSelect: (String) -> Unit, onRefresh: () -> Unit, onCancel: () -> Unit) {
+    val selectionLocked = vpn.phase in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.DISCONNECTING) || vpn.cleanupRequired
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
@@ -95,17 +99,19 @@ private fun ProfilesScreen(state: SubscriptionState, modifier: Modifier, onSelec
         if (state.loading) item { LoadingRow(onCancel) }
         if (state.error != null) item { ErrorText(state.error) }
         if (state.skipped > 0) item { Text("Пропущено неподдерживаемых записей: ${state.skipped}", color = Muted, fontSize = 12.sp) }
+        if (selectionLocked) item { Text("Отключите VPN, чтобы выбрать другой сервер.", color = Muted, fontSize = 12.sp) }
         if (state.profiles.isEmpty() && !state.loading) item {
             Text("Добавьте ссылку на подписку, чтобы загрузить список серверов.", color = Muted, fontSize = 14.sp, lineHeight = 21.sp)
         }
         items(state.profiles, key = { it.link }) { profile ->
-            ProfileRow(profile, profile.link == state.selectedLink, state.loading, onSelect)
+            ProfileRow(profile, profile.link == state.selectedLink, state.loading || selectionLocked, onSelect)
         }
     }
 }
 
 @Composable
-internal fun ProfileRow(profile: Profile, selected: Boolean, loading: Boolean, onSelect: (String) -> Unit) {
+internal fun ProfileRow(profile: Profile, selected: Boolean, loading: Boolean, onSelect: (String) -> Unit,
+    selectedSubtitle: String = "Выбранный профиль") {
     Surface(
         color = if (selected) Color(0xFF1B2B2D) else Surface,
         shape = RoundedCornerShape(12.dp),
@@ -118,7 +124,7 @@ internal fun ProfileRow(profile: Profile, selected: Boolean, loading: Boolean, o
             }
             Column(Modifier.weight(1f)) {
                 Text(profile.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Text(if (selected) "Выбранный профиль" else "VLESS", color = Muted, fontSize = 12.sp)
+                Text(if (selected) selectedSubtitle else "VLESS", color = Muted, fontSize = 12.sp)
             }
             Text(if (selected) "✓" else "›", color = if (selected) Accent else Muted, fontSize = 20.sp)
         }
@@ -159,11 +165,70 @@ private fun LoadingRow(onCancel: () -> Unit) {
 private fun ErrorText(error: String) { Text(error, color = Danger, fontSize = 13.sp, lineHeight = 19.sp) }
 
 @Composable
-private fun ConnectPlaceholder(state: SubscriptionState, modifier: Modifier) {
-    Column(modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text("Подключение", fontSize = 22.sp, fontWeight = FontWeight.Medium)
-        Text("VPN пока недоступен. Подключение появится на следующем этапе.", color = Muted, lineHeight = 22.sp)
-        state.profiles.firstOrNull { it.link == state.selectedLink }?.let { Text("Выбран: ${it.name}", color = Text) }
+private fun ConnectScreen(subscription: SubscriptionState, vpn: VpnState, available: Boolean, modifier: Modifier,
+    onChoose: () -> Unit, onConnect: (Profile) -> Unit, onStop: () -> Unit) {
+    val selected = subscription.profiles.firstOrNull { it.link == subscription.selectedLink }
+    val profile = vpn.profile ?: selected
+    val active = vpn.phase == VpnPhase.CONNECTED
+    val stopping = vpn.phase == VpnPhase.DISCONNECTING
+    val canStop = vpn.phase in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED) || vpn.cleanupRequired
+    val phaseText = when (vpn.phase) {
+        VpnPhase.DISCONNECTED -> "Отключено"
+        VpnPhase.PERMISSION -> "Ожидание разрешения"
+        VpnPhase.CONNECTING -> "Подключение"
+        VpnPhase.CONNECTED -> "Подключено"
+        VpnPhase.DISCONNECTING -> "Отключение"
+        VpnPhase.ERROR -> "Ошибка"
+    }
+    val checkText = when (vpn.check) {
+        CheckPhase.NOT_CHECKED -> "Не проверено"
+        CheckPhase.CHECKING -> "Проверяется"
+        CheckPhase.SUCCEEDED -> "Доступен"
+        CheckPhase.FAILED -> "Недоступен"
+    }
+    Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        Surface(color = Color(0xFF151C25), shape = RoundedCornerShape(50), border = BorderStroke(1.dp, Border)) {
+            Text("●  $phaseText", color = if (active) Accent else Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp))
+        }
+        if (profile != null) {
+            ProfileRow(profile, selected = true, loading = false, onSelect = { onChoose() },
+                selectedSubtitle = if (vpn.profile != null) "Профиль текущей сессии" else "Выбранный профиль")
+        } else {
+            Surface(color = Surface, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, Border), modifier = Modifier.fillMaxWidth().clickable(onClick = onChoose)) {
+                Text("Выберите сервер", modifier = Modifier.padding(18.dp), color = Muted)
+            }
+        }
+        Column(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            val enabled = available && !stopping && (canStop || selected != null)
+            val label = if (canStop) "Остановить VPN" else "Подключить VPN"
+            Box(Modifier.size(148.dp).background(Color.Transparent, RoundedCornerShape(50)).then(
+                Modifier.clickable(enabled = enabled, role = Role.Button, onClickLabel = label) {
+                    if (canStop) onStop() else selected?.let(onConnect)
+                }.semantics { contentDescription = label },
+            ), contentAlignment = Alignment.Center) {
+                Surface(Modifier.size(136.dp), color = Color.Transparent, shape = RoundedCornerShape(50), border = BorderStroke(1.dp, if (active) Accent.copy(alpha = 0.3f) else Border)) {}
+                Surface(Modifier.size(112.dp), color = if (active) Accent else Surface, shape = RoundedCornerShape(50), border = BorderStroke(1.dp, Border)) {
+                    Box(contentAlignment = Alignment.Center) { LineIcon("power", if (active) Color(0xFF102D26) else Muted, 44) }
+                }
+            }
+            Text(if (active) "VPN подключён" else phaseText, fontSize = 24.sp, fontWeight = FontWeight.SemiBold)
+            Text(if (profile == null) "Выберите профиль для подключения" else if (active) "Туннель активен" else "Системный VPN", color = Muted, fontSize = 12.sp)
+        }
+        Surface(color = Surface, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, Border)) {
+            Row(Modifier.fillMaxWidth().padding(vertical = 14.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("VPN-туннель", color = Muted, fontSize = 11.sp)
+                    Text(phaseText, color = if (active) Accent else Text, fontSize = 12.sp)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Проверка интернета", color = Muted, fontSize = 11.sp)
+                    Text(checkText, color = if (vpn.check == CheckPhase.SUCCEEDED) Accent else Text, fontSize = 12.sp)
+                }
+            }
+        }
+        if (vpn.error != null) ErrorText(vpn.error)
+        if (vpn.cleanupRequired) TextButton(onClick = onStop) { Text("Повторить остановку") }
     }
 }
 
@@ -186,8 +251,8 @@ private fun NavItem(icon: String, label: String, selected: Boolean, onClick: () 
 }
 
 @Composable
-internal fun LineIcon(name: String, color: Color) {
-    Canvas(Modifier.size(20.dp)) {
+internal fun LineIcon(name: String, color: Color, iconSize: Int = 20) {
+    Canvas(Modifier.size(iconSize.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
             when (name) {

@@ -1,0 +1,9 @@
+# Android VPN integration
+
+The Android VPN uses the official [libXray v26.10.31 release](https://github.com/XTLS/libXray/releases/tag/v26.10.31), which embeds Xray-core v26.10.31. `:app:fetchXray` downloads the Android release archive and checks its SHA-256 before extracting the AAR. The APK is currently built for `arm64-v8a`; the first build needs network access. Licenses for libXray and Xray-core are in `docs/licenses/`.
+
+The service passes its `VpnService` TUN file descriptor to Xray and registers `VpnService.protect` for Xray's outgoing sockets, including its bootstrap DNS resolver. The only Xray outbound comes from the selected VLESS profile; no direct fallback is configured. Android directs IPv4 and the configured DNS server (1.1.1.1) into the TUN. IPv6 is not enabled for this VPN and is blocked by Android while it is active. Xray's own protected bootstrap DNS lookup for the server is outside the tunnel. Stopping the VPN restores Android's normal routing; this is not an always-on kill switch.
+
+The foreground service owns the session independently of the activity. VPN tunnel state and the HTTPS connectivity check are separate; an unsuccessful check does not assert that the tunnel stopped. The check requests `https://www.google.com/generate_204` through Android's VPN network with bounded timeouts and may fail when that endpoint is blocked. No configuration or profile credentials should be written to logs, fixtures or Git.
+
+Build and run with the commands in the root README. To validate routing, test with synthetic servers or supply provider credentials locally: check browser HTTPS traffic, egress IP, DNS, TCP/UDP, blocked IPv6, service backgrounding and restored connectivity after disconnecting. A running Xray core, a VPN icon, or tests using a fake adapter do not prove network traffic traversed the tunnel.
