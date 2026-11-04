@@ -8,7 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-enum class VpnPhase { DISCONNECTED, PERMISSION, CONNECTING, CONNECTED, DISCONNECTING, ERROR }
+enum class VpnPhase { DISCONNECTED, PERMISSION, CONNECTING, CONNECTED, SWITCHING, DISCONNECTING, ERROR }
 enum class CheckPhase { NOT_CHECKED, CHECKING, SUCCEEDED, FAILED }
 
 data class VpnState(
@@ -22,6 +22,7 @@ data class VpnState(
 interface VpnAdapter {
     suspend fun start(profile: Profile)
     suspend fun stop()
+    suspend fun stopForSwitch() = stop()
     suspend fun check(): Boolean
 }
 
@@ -49,28 +50,52 @@ class VpnSession(private val adapter: VpnAdapter, private val scope: CoroutineSc
         val profile = state.value.profile ?: return
         val token = ++generation
         mutableState.value = state.value.copy(phase = VpnPhase.CONNECTING)
+        startJob = scope.launch { startProfile(profile, token) }
+    }
+
+    fun switchTo(profile: Profile): Boolean {
+        if (state.value.phase != VpnPhase.CONNECTED) return false
+        val token = ++generation
+        checkJob?.cancel()
+        mutableState.value = state.value.copy(phase = VpnPhase.SWITCHING, check = CheckPhase.NOT_CHECKED)
         startJob = scope.launch {
             try {
-                adapter.start(profile)
-                if (generation != token) return@launch
-                mutableState.value = state.value.copy(phase = VpnPhase.CONNECTED, check = CheckPhase.CHECKING)
-                checkJob = scope.launch {
-                    val passed = try { adapter.check() } catch (_: TimeoutCancellationException) { false } catch (e: CancellationException) { throw e } catch (_: Exception) { false }
-                    if (generation == token && state.value.phase == VpnPhase.CONNECTED) {
-                        mutableState.value = state.value.copy(check = if (passed) CheckPhase.SUCCEEDED else CheckPhase.FAILED)
-                    }
-                }
+                adapter.stopForSwitch()
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 if (generation != token) return@launch
-                mutableState.value = state.value.copy(phase = VpnPhase.DISCONNECTING)
-                try {
-                    adapter.stop()
-                    mutableState.value = VpnState(phase = VpnPhase.ERROR, error = "Не удалось запустить VPN.")
-                } catch (_: Exception) {
-                    mutableState.value = VpnState(phase = VpnPhase.ERROR, error = "Не удалось остановить VPN. Повторите остановку.", cleanupRequired = true)
+                mutableState.value = state.value.copy(phase = VpnPhase.ERROR, error = "Не удалось остановить VPN. Повторите остановку.", cleanupRequired = true)
+                return@launch
+            }
+            if (generation != token) return@launch
+            mutableState.value = VpnState(phase = VpnPhase.CONNECTING, profile = profile)
+            startProfile(profile, token)
+        }
+        return true
+    }
+
+    private suspend fun startProfile(profile: Profile, token: Int) {
+        try {
+            adapter.start(profile)
+            if (generation != token) return
+            mutableState.value = state.value.copy(phase = VpnPhase.CONNECTED, check = CheckPhase.CHECKING)
+            checkJob = scope.launch {
+                val passed = try { adapter.check() } catch (_: TimeoutCancellationException) { false } catch (e: CancellationException) { throw e } catch (_: Exception) { false }
+                if (generation == token && state.value.phase == VpnPhase.CONNECTED) {
+                    mutableState.value = state.value.copy(check = if (passed) CheckPhase.SUCCEEDED else CheckPhase.FAILED)
                 }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            if (generation != token) return
+            mutableState.value = state.value.copy(phase = VpnPhase.DISCONNECTING)
+            try {
+                adapter.stop()
+                mutableState.value = VpnState(phase = VpnPhase.ERROR, profile = profile, error = "Не удалось запустить VPN.")
+            } catch (_: Exception) {
+                mutableState.value = VpnState(phase = VpnPhase.ERROR, profile = profile, error = "Не удалось остановить VPN. Повторите остановку.", cleanupRequired = true)
             }
         }
     }

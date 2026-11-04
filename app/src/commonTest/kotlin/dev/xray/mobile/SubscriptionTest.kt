@@ -76,6 +76,36 @@ class SubscriptionTest {
     }
 
     @Test
+    fun refreshingAwayActiveProfileDoesNotStopOrReplaceVpn() = runTest {
+        val first = "vless://00000000-0000-4000-8000-000000000000@example.test:443?type=xhttp&security=tls#First"
+        val second = "vless://11111111-1111-4111-8111-111111111111@example.test:443?type=xhttp&security=tls#Second"
+        var response = Base64.encode(first.encodeToByteArray())
+        val app = SubscriptionApp(SubscriptionSource { response }, MemoryStorage())
+        val adapter = object : VpnAdapter {
+            override suspend fun start(profile: Profile) = Unit
+            override suspend fun stop() = Unit
+            override suspend fun check() = true
+        }
+        val vpn = VpnSession(adapter, backgroundScope)
+        app.load("https://example.test/subscription")
+        app.select(first)
+        val active = app.state.value.profiles.single()
+        vpn.connect(active)
+        vpn.permissionResult(true)
+        runCurrent()
+
+        response = Base64.encode(second.encodeToByteArray())
+        app.load("https://example.test/subscription")
+        assertNull(app.state.value.selectedLink)
+        assertEquals(active, vpn.state.value.profile)
+        assertEquals(VpnPhase.CONNECTED, vpn.state.value.phase)
+        response = "not base64!"
+        assertEquals(false, app.load("https://example.test/subscription"))
+        assertEquals(active, vpn.state.value.profile)
+        assertEquals(VpnPhase.CONNECTED, vpn.state.value.phase)
+    }
+
+    @Test
     fun cancelledDownloadLeavesSavedDataUntouched() = runTest {
         val storage = MemoryStorage()
         val pending = CompletableDeferred<String>()

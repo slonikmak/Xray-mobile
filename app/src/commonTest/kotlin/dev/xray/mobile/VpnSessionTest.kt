@@ -159,6 +159,141 @@ class VpnSessionTest {
         runCurrent()
         assertEquals(VpnPhase.DISCONNECTED, session.state.value.phase)
     }
+
+    @Test
+    fun switchingWaitsForOldTunnelToStopBeforeStartingNewProfile() = runTest {
+        val adapter = FakeVpnAdapter()
+        val session = VpnSession(adapter, backgroundScope)
+        val first = Profile("First", "first")
+        val second = Profile("Second", "second")
+        session.connect(first)
+        session.permissionResult(true)
+        runCurrent()
+        val pendingStop = CompletableDeferred<Unit>()
+        adapter.stopPending = pendingStop
+
+        session.switchTo(second)
+        runCurrent()
+        assertEquals(VpnPhase.SWITCHING, session.state.value.phase)
+        assertEquals(first, session.state.value.profile)
+        assertEquals(listOf(first), adapter.startedProfiles)
+        assertFalse(session.switchTo(second))
+        pendingStop.complete(Unit)
+        runCurrent()
+        assertEquals(VpnPhase.CONNECTED, session.state.value.phase)
+        assertEquals(second, session.state.value.profile)
+        assertEquals(listOf(first, second), adapter.startedProfiles)
+    }
+
+    @Test
+    fun failedStopDuringSwitchBlocksNewProfileUntilCleanupIsRetried() = runTest {
+        val adapter = FakeVpnAdapter()
+        val session = VpnSession(adapter, backgroundScope)
+        val first = Profile("First", "first")
+        val second = Profile("Second", "second")
+        session.connect(first)
+        session.permissionResult(true)
+        runCurrent()
+        adapter.failStop = true
+        session.switchTo(second)
+        runCurrent()
+        assertEquals(VpnPhase.ERROR, session.state.value.phase)
+        assertEquals(true, session.state.value.cleanupRequired)
+        assertEquals(listOf(first), adapter.startedProfiles)
+        assertFalse(session.connect(second))
+        adapter.failStop = false
+        session.stop()
+        runCurrent()
+        assertEquals(VpnPhase.DISCONNECTED, session.state.value.phase)
+        assertEquals(listOf(first), adapter.startedProfiles)
+    }
+
+    @Test
+    fun failedNewProfileDoesNotRestartOldProfileAutomatically() = runTest {
+        val adapter = FakeVpnAdapter()
+        val session = VpnSession(adapter, backgroundScope)
+        val first = Profile("First", "first")
+        val second = Profile("Second", "second")
+        session.connect(first)
+        session.permissionResult(true)
+        runCurrent()
+        adapter.failStart = true
+        session.switchTo(second)
+        runCurrent()
+        assertEquals(VpnPhase.ERROR, session.state.value.phase)
+        assertEquals(second, session.state.value.profile)
+        assertEquals(listOf(first, second), adapter.startedProfiles)
+        assertFalse(adapter.started)
+        adapter.failStart = false
+        session.connect(second)
+        session.permissionResult(true)
+        runCurrent()
+        assertEquals(VpnPhase.CONNECTED, session.state.value.phase)
+        assertEquals(listOf(first, second, second), adapter.startedProfiles)
+    }
+
+    @Test
+    fun cancellingSwitchStopsWithoutStartingNewProfile() = runTest {
+        val adapter = FakeVpnAdapter()
+        val session = VpnSession(adapter, backgroundScope)
+        val first = Profile("First", "first")
+        val second = Profile("Second", "second")
+        session.connect(first)
+        session.permissionResult(true)
+        runCurrent()
+        val pendingStop = CompletableDeferred<Unit>()
+        adapter.stopPending = pendingStop
+        session.switchTo(second)
+        runCurrent()
+        session.stop()
+        runCurrent()
+        assertEquals(VpnPhase.DISCONNECTING, session.state.value.phase)
+        assertFalse(session.switchTo(second))
+        pendingStop.complete(Unit)
+        runCurrent()
+        assertEquals(VpnPhase.DISCONNECTED, session.state.value.phase)
+        assertEquals(listOf(first), adapter.startedProfiles)
+    }
+
+    @Test
+    fun oldConnectionCheckCannotOverwriteNewProfileState() = runTest {
+        val pendingCheck = CompletableDeferred<Boolean>()
+        val adapter = FakeVpnAdapter().apply { checkPending = pendingCheck }
+        val session = VpnSession(adapter, backgroundScope)
+        session.connect(Profile("First", "first"))
+        session.permissionResult(true)
+        runCurrent()
+        adapter.checkPending = null
+        val second = Profile("Second", "second")
+        session.switchTo(second)
+        runCurrent()
+        pendingCheck.complete(false)
+        runCurrent()
+        assertEquals(second, session.state.value.profile)
+        assertEquals(CheckPhase.SUCCEEDED, session.state.value.check)
+    }
+
+    @Test
+    fun manualRetryAfterFailedCheckStopsAndRestartsCurrentProfile() = runTest {
+        val adapter = FakeVpnAdapter().apply { checkResult = false }
+        val session = VpnSession(adapter, backgroundScope)
+        val profile = Profile("First", "first")
+        session.connect(profile)
+        session.permissionResult(true)
+        runCurrent()
+        assertEquals(CheckPhase.FAILED, session.state.value.check)
+        val pendingStop = CompletableDeferred<Unit>()
+        adapter.stopPending = pendingStop
+        adapter.checkResult = true
+        session.switchTo(profile)
+        runCurrent()
+        assertEquals(VpnPhase.SWITCHING, session.state.value.phase)
+        assertEquals(listOf(profile), adapter.startedProfiles)
+        pendingStop.complete(Unit)
+        runCurrent()
+        assertEquals(CheckPhase.SUCCEEDED, session.state.value.check)
+        assertEquals(listOf(profile, profile), adapter.startedProfiles)
+    }
 }
 
 private class FakeVpnAdapter : VpnAdapter {
@@ -169,11 +304,14 @@ private class FakeVpnAdapter : VpnAdapter {
     var failStart = false
     var timeoutCheck = false
     var startPending: CompletableDeferred<Unit>? = null
+    var stopPending: CompletableDeferred<Unit>? = null
+    val startedProfiles = mutableListOf<Profile>()
     override suspend fun start(profile: Profile) {
         started = true
+        startedProfiles.add(profile)
         startPending?.let { withContext(NonCancellable) { it.await() } }
         if (failStart) error("start failed")
     }
-    override suspend fun stop() { if (failStop) error("cleanup failed"); started = false }
+    override suspend fun stop() { stopPending?.await(); if (failStop) error("cleanup failed"); started = false }
     override suspend fun check(): Boolean = if (timeoutCheck) withTimeout(1) { delay(10); true } else checkPending?.await() ?: checkResult
 }

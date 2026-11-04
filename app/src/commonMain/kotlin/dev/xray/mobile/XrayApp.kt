@@ -73,9 +73,17 @@ fun XrayApp(app: SubscriptionApp, vpn: VpnSession?, onConnect: (Profile) -> Unit
                 },
             ) { padding ->
                 if (connectScreen) ConnectScreen(state, vpnState, vpn != null, Modifier.padding(padding),
-                    onChoose = { connectScreen = false }, onConnect = onConnect, onStop = onStop)
+                    onChoose = { connectScreen = false }, onConnect = onConnect, onStop = onStop,
+                    onRetry = { profile -> if (vpn?.state?.value?.phase == VpnPhase.CONNECTED) vpn.switchTo(profile) else onConnect(profile) })
                 else ProfilesScreen(state, vpnState, Modifier.padding(padding),
-                    onSelect = { link -> scope.launch { app.select(link) } },
+                    onSelect = { link -> scope.launch {
+                        if (app.select(link)) {
+                            val profile = app.state.value.profiles.firstOrNull { it.link == link }
+                            val current = vpn?.state?.value
+                            if (profile != null && current?.phase == VpnPhase.CONNECTED &&
+                                current.profile?.let { !sameProfile(it, profile) } == true) vpn.switchTo(profile)
+                        }
+                    } },
                     onRefresh = { load(state.url, false) }, onCancel = { loadJob?.cancel() })
             }
         }
@@ -84,7 +92,7 @@ fun XrayApp(app: SubscriptionApp, vpn: VpnSession?, onConnect: (Profile) -> Unit
 
 @Composable
 private fun ProfilesScreen(state: SubscriptionState, vpn: VpnState, modifier: Modifier, onSelect: (String) -> Unit, onRefresh: () -> Unit, onCancel: () -> Unit) {
-    val selectionLocked = vpn.phase in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.DISCONNECTING) || vpn.cleanupRequired
+    val selectionLocked = vpn.phase in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.SWITCHING, VpnPhase.DISCONNECTING) || vpn.cleanupRequired
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
@@ -99,19 +107,20 @@ private fun ProfilesScreen(state: SubscriptionState, vpn: VpnState, modifier: Mo
         if (state.loading) item { LoadingRow(onCancel) }
         if (state.error != null) item { ErrorText(state.error) }
         if (state.skipped > 0) item { Text("Пропущено неподдерживаемых записей: ${state.skipped}", color = Muted, fontSize = 12.sp) }
-        if (selectionLocked) item { Text("Отключите VPN, чтобы выбрать другой сервер.", color = Muted, fontSize = 12.sp) }
+        if (selectionLocked) item { Text("Дождитесь завершения текущей операции.", color = Muted, fontSize = 12.sp) }
         if (state.profiles.isEmpty() && !state.loading) item {
             Text("Добавьте ссылку на подписку, чтобы загрузить список серверов.", color = Muted, fontSize = 14.sp, lineHeight = 21.sp)
         }
         items(state.profiles, key = { it.link }) { profile ->
-            ProfileRow(profile, profile.link == state.selectedLink, state.loading || selectionLocked, onSelect)
+            val active = vpn.profile?.let { sameProfile(it, profile) } == true && vpn.phase in setOf(VpnPhase.CONNECTED, VpnPhase.SWITCHING)
+            ProfileRow(profile, profile.link == state.selectedLink, state.loading || selectionLocked, onSelect, active = active)
         }
     }
 }
 
 @Composable
 internal fun ProfileRow(profile: Profile, selected: Boolean, loading: Boolean, onSelect: (String) -> Unit,
-    selectedSubtitle: String = "Выбранный профиль") {
+    selectedSubtitle: String = "Выбранный профиль", active: Boolean = false) {
     Surface(
         color = if (selected) Color(0xFF1B2B2D) else Surface,
         shape = RoundedCornerShape(12.dp),
@@ -124,7 +133,7 @@ internal fun ProfileRow(profile: Profile, selected: Boolean, loading: Boolean, o
             }
             Column(Modifier.weight(1f)) {
                 Text(profile.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Text(if (selected) selectedSubtitle else "VLESS", color = Muted, fontSize = 12.sp)
+                Text(if (active) "Активный сервер" else if (selected) selectedSubtitle else "VLESS", color = Muted, fontSize = 12.sp)
             }
             Text(if (selected) "✓" else "›", color = if (selected) Accent else Muted, fontSize = 20.sp)
         }
@@ -166,17 +175,19 @@ private fun ErrorText(error: String) { Text(error, color = Danger, fontSize = 13
 
 @Composable
 private fun ConnectScreen(subscription: SubscriptionState, vpn: VpnState, available: Boolean, modifier: Modifier,
-    onChoose: () -> Unit, onConnect: (Profile) -> Unit, onStop: () -> Unit) {
+    onChoose: () -> Unit, onConnect: (Profile) -> Unit, onStop: () -> Unit, onRetry: (Profile) -> Unit) {
     val selected = subscription.profiles.firstOrNull { it.link == subscription.selectedLink }
-    val profile = vpn.profile ?: selected
+    val sessionInProgress = vpn.phase in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.SWITCHING, VpnPhase.DISCONNECTING) || vpn.cleanupRequired
+    val profile = if (sessionInProgress) vpn.profile ?: selected else selected ?: vpn.profile
     val active = vpn.phase == VpnPhase.CONNECTED
     val stopping = vpn.phase == VpnPhase.DISCONNECTING
-    val canStop = vpn.phase in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED) || vpn.cleanupRequired
+    val canStop = vpn.phase in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.SWITCHING) || vpn.cleanupRequired
     val phaseText = when (vpn.phase) {
         VpnPhase.DISCONNECTED -> "Отключено"
         VpnPhase.PERMISSION -> "Ожидание разрешения"
         VpnPhase.CONNECTING -> "Подключение"
         VpnPhase.CONNECTED -> "Подключено"
+        VpnPhase.SWITCHING -> "Переключение"
         VpnPhase.DISCONNECTING -> "Отключение"
         VpnPhase.ERROR -> "Ошибка"
     }
@@ -193,7 +204,7 @@ private fun ConnectScreen(subscription: SubscriptionState, vpn: VpnState, availa
         }
         if (profile != null) {
             ProfileRow(profile, selected = true, loading = false, onSelect = { onChoose() },
-                selectedSubtitle = if (vpn.profile != null) "Профиль текущей сессии" else "Выбранный профиль")
+                selectedSubtitle = if (vpn.profile != null && sessionInProgress) "Профиль текущей сессии" else if (selected == null) "Последний профиль" else "Выбранный профиль")
         } else {
             Surface(color = Surface, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, Border), modifier = Modifier.fillMaxWidth().clickable(onClick = onChoose)) {
                 Text("Выберите сервер", modifier = Modifier.padding(18.dp), color = Muted)
@@ -229,6 +240,9 @@ private fun ConnectScreen(subscription: SubscriptionState, vpn: VpnState, availa
         }
         if (vpn.error != null) ErrorText(vpn.error)
         if (vpn.cleanupRequired) TextButton(onClick = onStop) { Text("Повторить остановку") }
+        else if (selected != null && (vpn.phase == VpnPhase.ERROR || vpn.phase == VpnPhase.CONNECTED && vpn.check == CheckPhase.FAILED)) {
+            TextButton(onClick = { onRetry(selected) }) { Text("Повторить подключение") }
+        }
     }
 }
 

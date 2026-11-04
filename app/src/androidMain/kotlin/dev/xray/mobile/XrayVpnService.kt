@@ -74,7 +74,7 @@ class XrayVpnService : VpnService(), VpnAdapter {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (session.state.value.phase !in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED)) {
+        if (session.state.value.phase !in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.SWITCHING)) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -138,11 +138,11 @@ class XrayVpnService : VpnService(), VpnAdapter {
 
     override fun onDestroy() {
         val phase = session.state.value.phase
-        val needsCleanup = phase in setOf(VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.DISCONNECTING) ||
+        val needsCleanup = phase in setOf(VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.SWITCHING, VpnPhase.DISCONNECTING) ||
             VpnSocketProtector.owner() === this
         if (needsCleanup) {
             rememberCleanup(true)
-            if (phase in setOf(VpnPhase.CONNECTING, VpnPhase.CONNECTED) && getSharedPreferences("vpn-state", MODE_PRIVATE).getString("error", null) == null) {
+            if (phase in setOf(VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.SWITCHING) && getSharedPreferences("vpn-state", MODE_PRIVATE).getString("error", null) == null) {
                 rememberError("VPN был неожиданно остановлен.")
             }
         }
@@ -198,12 +198,16 @@ class XrayVpnService : VpnService(), VpnAdapter {
         throw e
     } }
 
-    override suspend fun stop() {
+    override suspend fun stop() = stopEngine(keepRunning = false)
+
+    override suspend fun stopForSwitch() = stopEngine(keepRunning = true)
+
+    private suspend fun stopEngine(keepRunning: Boolean) {
         try {
             VpnSocketProtector.awaitCleanup()
             VpnSocketProtector.owner()?.takeIf { it !== this }?.cleanupEngine()
             cleanupEngine()
-            rememberCleanup(false)
+            if (!keepRunning) rememberCleanup(false)
             val saved = getSharedPreferences("vpn-state", MODE_PRIVATE)
             if (saved.getString("error", null) == "Не удалось остановить VPN. Повторите остановку.") rememberError(null)
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -213,8 +217,10 @@ class XrayVpnService : VpnService(), VpnAdapter {
             rememberCleanup(true)
             throw e
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (!keepRunning) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     private suspend fun cleanupEngine() = engineLock.withLock {

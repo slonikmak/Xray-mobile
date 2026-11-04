@@ -88,16 +88,18 @@ class SubscriptionApp(private val source: SubscriptionSource, private val storag
         }
     }
 
-    suspend fun select(link: String) {
-        if (state.value.loading || state.value.profiles.none { it.link == link }) return
+    suspend fun select(link: String): Boolean {
+        if (state.value.loading || state.value.profiles.none { it.link == link }) return false
         val next = state.value.copy(selectedLink = link)
         try {
             storage.write(Json.encodeToString(next))
             mutableState.value = next
+            return true
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             mutableState.value = state.value.copy(error = "Не удалось сохранить выбор профиля.")
+            return false
         }
     }
 }
@@ -108,6 +110,9 @@ private fun profileIdentity(link: String): ProfileIdentity {
     val url = Url(link)
     return ProfileIdentity(url.user, url.host.lowercase(), url.port, url.parameters.entries().associate { it.key to it.value })
 }
+
+internal fun sameProfile(first: Profile, second: Profile): Boolean =
+    runCatching { profileIdentity(first.link) == profileIdentity(second.link) }.getOrDefault(false)
 
 class SubscriptionError(message: String) : Exception(message)
 
