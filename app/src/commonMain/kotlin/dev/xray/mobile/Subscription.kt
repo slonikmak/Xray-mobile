@@ -10,6 +10,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
@@ -128,9 +129,7 @@ private fun parseProfile(link: String): Profile? {
     val allowed = setOf("type", "security", "encryption", "flow", "sni", "fp", "alpn", "host", "path", "mode", "extra", "pbk", "sid", "spx", "headerType")
     val fingerprints = setOf("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "randomizednoalpn", "unsafe")
     val fingerprintValid = params["fp"] == null || params["fp"] in fingerprints
-    val extraValid = params["extra"]?.let {
-        runCatching { (Json.parseToJsonElement(it) as? JsonObject)?.isEmpty() == true }.getOrDefault(false)
-    } ?: true
+    val extraValid = params["extra"]?.let(::validXhttpExtra) ?: true
     val supported = when (params["type"] to params["security"]) {
         "xhttp" to "tls" -> params["flow"].isNullOrEmpty() &&
             params["mode"] in listOf(null, "auto", "packet-up", "stream-up", "stream-one") &&
@@ -155,3 +154,28 @@ private fun parseProfile(link: String): Profile? {
         null
     }
 }
+
+private fun validXhttpExtra(value: String): Boolean = runCatching {
+    val extra = Json.parseToJsonElement(value) as? JsonObject ?: return false
+    if (extra.keys.any { it != "xmux" }) return false
+    val xmux = extra["xmux"] ?: return true
+    if (xmux !is JsonObject) return false
+    val ranges = setOf("maxConcurrency", "maxConnections", "cMaxReuseTimes", "hMaxRequestTimes", "hMaxReusableSecs")
+    if (xmux.keys.any { it !in ranges && it != "hKeepAlivePeriod" }) return false
+    fun range(name: String): Pair<Int, Int>? {
+        val element = xmux[name] ?: return 0 to 0
+        val primitive = element as? JsonPrimitive ?: return null
+        if (!primitive.isString) return primitive.content.toIntOrNull()?.let { it to it }
+        if (primitive.content.isEmpty()) return 0 to 0
+        val match = Regex("(-?\\d+)(?:-(-?\\d+))?").matchEntire(primitive.content) ?: return null
+        val first = match.groupValues[1].toIntOrNull() ?: return null
+        val second = if (match.groupValues[2].isEmpty()) first else match.groupValues[2].toIntOrNull() ?: return null
+        return first to second
+    }
+    val parsedRanges = ranges.associateWith { range(it) ?: return false }
+    val keepAlive = xmux["hKeepAlivePeriod"]
+    if (keepAlive != null && (keepAlive !is JsonPrimitive || keepAlive.isString || keepAlive.content.toLongOrNull() == null)) return false
+    val concurrency = parsedRanges.getValue("maxConcurrency")
+    val connections = parsedRanges.getValue("maxConnections")
+    maxOf(concurrency.first, concurrency.second) <= 0 || maxOf(connections.first, connections.second) <= 0
+}.getOrDefault(false)

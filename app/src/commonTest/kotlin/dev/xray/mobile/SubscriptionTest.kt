@@ -17,6 +17,7 @@ import io.ktor.client.engine.mock.respond
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.HttpHeaders
 import io.ktor.http.headersOf
+import io.ktor.http.encodeURLParameter
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
@@ -102,6 +103,41 @@ class SubscriptionTest {
         assertEquals(listOf(xhttp, reality), app.state.value.profiles.map { it.link })
         assertEquals("Long name", app.state.value.profiles.first().name)
         assertEquals(1, app.state.value.skipped)
+    }
+
+    @Test
+    fun importsAndRestoresXhttpProfileWithXmuxSettings() = runTest {
+        val extra = """{"xmux":{"maxConcurrency":0,"maxConnections":1,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":-1}}"""
+        val link = "vless://00000000-0000-4000-8000-000000000000@example.test:443?type=xhttp&security=tls&mode=packet-up&extra=${extra.encodeURLParameter()}#Example"
+        val storage = MemoryStorage()
+        val source = SubscriptionSource { Base64.encode(link.encodeToByteArray()) }
+        val app = SubscriptionApp(source, storage)
+
+        assertEquals(true, app.load("https://example.test/subscription"))
+        val restored = SubscriptionApp(source, storage)
+        restored.restore()
+        assertEquals(link, restored.state.value.profiles.single().link)
+        assertEquals(0, restored.state.value.skipped)
+    }
+
+    @Test
+    fun skipsInvalidXmuxAndUnknownExtraSettings() = runTest {
+        val base = "vless://00000000-0000-4000-8000-000000000000@example.test:443?type=xhttp&security=tls"
+        fun profile(extra: String) = "$base&extra=${extra.encodeURLParameter()}"
+        val valid = profile("""{"xmux":{"maxConnections":2}}""")
+        val invalid = listOf(
+            """{"xmux":{"maxConnections":"bad"}}""",
+            """{"xmux":{"hKeepAlivePeriod":"60"}}""",
+            """{"xmux":{"maxConnections":1,"maxConcurrency":1}}""",
+            """{"xmux":{"unknown":1}}""",
+            """{"xmux":{},"downloadSettings":{}}""",
+        ).map(::profile)
+        val response = Base64.encode((listOf(valid) + invalid).joinToString("\n").encodeToByteArray())
+        val app = SubscriptionApp(SubscriptionSource { response }, MemoryStorage())
+
+        assertEquals(true, app.load("https://example.test/subscription"))
+        assertEquals(listOf(valid), app.state.value.profiles.map { it.link })
+        assertEquals(invalid.size, app.state.value.skipped)
     }
 
     @Test
