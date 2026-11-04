@@ -3,9 +3,7 @@ import java.security.MessageDigest
 import java.util.zip.ZipFile
 
 plugins {
-    kotlin("multiplatform")
     kotlin("plugin.compose")
-    kotlin("plugin.serialization")
     id("com.android.application")
     id("org.jetbrains.compose")
 }
@@ -38,40 +36,29 @@ val fetchXray = tasks.register("fetchXray") {
     }
 }
 
-kotlin {
-    androidTarget()
-    jvm("desktop")
-    sourceSets {
-        commonMain.dependencies {
-            implementation(compose.runtime)
-            implementation(compose.foundation)
-            implementation(compose.material3)
-            implementation(compose.ui)
-            implementation(compose.components.resources)
-            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-            implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
-            implementation("io.ktor:ktor-client-core:3.1.3")
-        }
-        commonTest.dependencies {
-            implementation(kotlin("test"))
-            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
-            implementation("io.ktor:ktor-client-mock:3.1.3")
-        }
-        androidMain.dependencies {
-            implementation(files(xrayAar).builtBy(fetchXray))
-            implementation("androidx.activity:activity-compose:1.10.1")
-            implementation("io.ktor:ktor-client-okhttp:3.1.3")
-        }
-        getByName("desktopMain").dependencies { implementation("io.ktor:ktor-client-okhttp:3.1.3") }
-    }
-}
-
-compose.resources { packageOfResClass = "dev.xray.mobile.resources" }
-
-android {
+configure<com.android.build.api.dsl.ApplicationExtension> {
     namespace = "dev.xray.mobile"
-    compileSdk = 36
+    compileSdk = 37
     buildToolsVersion = "36.0.0"
     defaultConfig { applicationId = "dev.xray.mobile"; minSdk = 26; targetSdk = 35; ndk.abiFilters += "arm64-v8a" }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+    buildFeatures { compose = true }
+    testOptions { unitTests.isIncludeAndroidResources = true }
+}
+
+configure<com.android.build.api.variant.ApplicationAndroidComponentsExtension> {
+    beforeVariants(selector().withBuildType("release")) { variant ->
+        (variant as com.android.build.api.variant.HasUnitTestBuilder).enableUnitTest = true
+    }
+}
+
+dependencies {
+    implementation(project(":shared"))
+    implementation(files(xrayAar).builtBy(fetchXray))
+    implementation(compose.runtime)
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
+    implementation("io.ktor:ktor-client-okhttp:3.6.1")
+    implementation("androidx.core:core-ktx:1.19.1")
 }

@@ -1,5 +1,9 @@
 # xray-multiplatform
 
+## UI design
+
+Before implementing, changing, or reviewing UI, read [the design handoff](docs/agents/design.md) and inspect the relevant frames in [the Pencil source](design/xray-mobile.pen). Use its visual system and follow the handoff's MVP adaptations; verify implemented screens visually before closing a UI ticket.
+
 ## Agent skills
 
 ### Issue tracker

@@ -10,6 +10,7 @@ import io.ktor.http.URLBuilder
 import io.ktor.http.takeFrom
 import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.withTimeout
+import kotlin.time.Duration.Companion.milliseconds
 
 class HttpSubscriptionSource(engine: HttpClientEngine) : SubscriptionSource {
     private val client = HttpClient(engine) {
@@ -17,7 +18,7 @@ class HttpSubscriptionSource(engine: HttpClientEngine) : SubscriptionSource {
         install(HttpTimeout) { connectTimeoutMillis = 10_000; socketTimeoutMillis = 15_000 }
     }
 
-    override suspend fun fetch(url: String): String = withTimeout(30_000) {
+    override suspend fun fetch(url: String): String = withTimeout(30_000.milliseconds) {
         var address = url
         repeat(6) {
             if (!isHttpsAddress(address)) throw SubscriptionError("Ссылка перенаправляет на недопустимый адрес.")

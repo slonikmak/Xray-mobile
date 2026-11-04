@@ -157,7 +157,7 @@ class XrayVpnService : VpnService(), VpnAdapter {
                     cleanupEngine()
                     VpnSocketProtector.finishCleanup(cleanup) { rememberCleanup(false) }
                 } catch (_: Exception) {
-                    rememberError("Не удалось остановить VPN. Повторите остановку.")
+                    rememberError(VPN_CLEANUP_ERROR)
                 }
             }
             VpnSocketProtector.trackCleanup(cleanup) { rememberCleanup(true) }
@@ -209,11 +209,11 @@ class XrayVpnService : VpnService(), VpnAdapter {
             cleanupEngine()
             if (!keepRunning) rememberCleanup(false)
             val saved = getSharedPreferences("vpn-state", MODE_PRIVATE)
-            if (saved.getString("error", null) == "Не удалось остановить VPN. Повторите остановку.") rememberError(null)
+            if (saved.getString("error", null) == VPN_CLEANUP_ERROR) rememberError(null)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            rememberError("Не удалось остановить VPN. Повторите остановку.")
+            rememberError(VPN_CLEANUP_ERROR)
             rememberCleanup(true)
             throw e
         }

@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+const val VPN_CLEANUP_ERROR = "Не удалось остановить VPN. Повторите остановку."
+
 enum class VpnPhase { DISCONNECTED, PERMISSION, CONNECTING, CONNECTED, SWITCHING, DISCONNECTING, ERROR }
 enum class CheckPhase { NOT_CHECKED, CHECKING, SUCCEEDED, FAILED }
 
@@ -65,7 +67,7 @@ class VpnSession(private val adapter: VpnAdapter, private val scope: CoroutineSc
                 throw e
             } catch (_: Exception) {
                 if (generation != token) return@launch
-                mutableState.value = state.value.copy(phase = VpnPhase.ERROR, error = "Не удалось остановить VPN. Повторите остановку.", cleanupRequired = true)
+                mutableState.value = state.value.copy(phase = VpnPhase.ERROR, error = VPN_CLEANUP_ERROR, cleanupRequired = true)
                 return@launch
             }
             if (generation != token) return@launch
@@ -95,7 +97,7 @@ class VpnSession(private val adapter: VpnAdapter, private val scope: CoroutineSc
                 adapter.stop()
                 mutableState.value = VpnState(phase = VpnPhase.ERROR, profile = profile, error = "Не удалось запустить VPN.")
             } catch (_: Exception) {
-                mutableState.value = VpnState(phase = VpnPhase.ERROR, profile = profile, error = "Не удалось остановить VPN. Повторите остановку.", cleanupRequired = true)
+                mutableState.value = VpnState(phase = VpnPhase.ERROR, profile = profile, error = VPN_CLEANUP_ERROR, cleanupRequired = true)
             }
         }
     }
@@ -123,7 +125,7 @@ class VpnSession(private val adapter: VpnAdapter, private val scope: CoroutineSc
                 adapter.stop()
                 mutableState.value = if (message == null) VpnState() else VpnState(phase = VpnPhase.ERROR, error = message)
             } catch (_: Exception) {
-                mutableState.value = VpnState(phase = VpnPhase.ERROR, error = "Не удалось остановить VPN. Повторите остановку.", cleanupRequired = true)
+                mutableState.value = VpnState(phase = VpnPhase.ERROR, error = VPN_CLEANUP_ERROR, cleanupRequired = true)
             }
         }
     }
