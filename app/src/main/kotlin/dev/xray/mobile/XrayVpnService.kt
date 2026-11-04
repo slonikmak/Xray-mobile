@@ -45,6 +45,7 @@ class XrayVpnService : VpnService(), VpnAdapter {
     private var coreTouched = false
     private var dnsInstalled = false
     private val engineLock = Mutex()
+    private val commandLock = Mutex()
 
     inner class LocalBinder : Binder() { val service get() = this@XrayVpnService }
 
@@ -64,9 +65,11 @@ class XrayVpnService : VpnService(), VpnAdapter {
                     val running = withContext(Dispatchers.IO) {
                         runCatching { call("getXrayState")["running"]?.jsonPrimitive?.content == "true" }.getOrDefault(false)
                     }
-                    if (!running && session.state.value === previous) {
-                        rememberError("VPN остановился из-за ошибки ядра.")
-                        session.terminated("VPN остановился из-за ошибки ядра.")
+                    if (!running && previous.sessionId != null) {
+                        commandLock.withLock {
+                            val message = "VPN остановился из-за ошибки ядра."
+                            if (session.terminated(message, previous.sessionId) != VpnStopResult.IGNORED) rememberError(message)
+                        }
                     }
                 }
             }
@@ -74,50 +77,64 @@ class XrayVpnService : VpnService(), VpnAdapter {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (session.state.value.phase !in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.SWITCHING)) {
+        val current = session.state.value
+        if (current.phase !in setOf(VpnPhase.PERMISSION, VpnPhase.CONNECTING, VpnPhase.CONNECTED, VpnPhase.SWITCHING) || current.sessionId == null) {
             stopSelf()
             return START_NOT_STICKY
         }
         try {
             startForeground(1, notification())
         } catch (_: Exception) {
-            rememberError("Не удалось показать уведомление VPN.")
-            session.terminated("Не удалось показать уведомление VPN.")
-            stopSelf()
+            scope.launch {
+                commandLock.withLock {
+                    val message = "Не удалось показать уведомление VPN."
+                    val result = session.terminated(message, current.sessionId)
+                    if (result != VpnStopResult.IGNORED) rememberError(message)
+                    if (result == VpnStopResult.PERMISSION) stopPendingPermission()
+                }
+            }
         }
         return START_NOT_STICKY
     }
 
     override fun onRevoke() {
-        val pendingPermission = session.state.value.phase == VpnPhase.PERMISSION
-        rememberError("Разрешение VPN было отозвано.")
-        session.terminated("Разрешение VPN было отозвано.")
-        if (pendingPermission) stopPendingPermission()
+        scope.launch {
+            commandLock.withLock {
+                val message = "Разрешение VPN было отозвано."
+                val result = session.terminated(message)
+                if (result != VpnStopResult.IGNORED) rememberError(message)
+                if (result == VpnStopResult.PERMISSION) stopPendingPermission()
+            }
+        }
     }
 
-    fun requestConnection(profile: Profile): Boolean {
-        if (!session.connect(profile)) return false
+    suspend fun requestConnection(profile: Profile): Long? = commandLock.withLock {
+        if (!session.connect(profile)) return@withLock null
+        val sessionId = session.state.value.sessionId ?: return@withLock null
         rememberCleanup(true)
         rememberError(null)
-        return true
+        sessionId
     }
 
-    fun permissionDenied() {
-        rememberError("Разрешение на VPN не получено.")
-        session.permissionResult(false)
-        stopPendingPermission()
+    fun handlePermission(granted: Boolean, sessionId: Long) {
+        scope.launch {
+            commandLock.withLock {
+                if (session.permissionResult(granted, sessionId) && !granted) {
+                    rememberError("Разрешение на VPN не получено.")
+                    stopPendingPermission()
+                }
+            }
+        }
     }
 
-    fun failPending(message: String) {
-        rememberError(message)
-        session.terminated(message)
-        stopPendingPermission()
+    suspend fun failPending(message: String, sessionId: Long) = commandLock.withLock {
+        val result = session.terminated(message, sessionId)
+        if (result != VpnStopResult.IGNORED) rememberError(message)
+        if (result == VpnStopResult.PERMISSION) stopPendingPermission()
     }
 
-    fun cancelOrStop() {
-        val pendingPermission = session.state.value.phase == VpnPhase.PERMISSION
-        session.stop()
-        if (pendingPermission) stopPendingPermission()
+    suspend fun cancelOrStop() = commandLock.withLock {
+        if (session.stop() == VpnStopResult.PERMISSION) stopPendingPermission()
     }
 
     private fun stopPendingPermission() {
@@ -194,7 +211,7 @@ class XrayVpnService : VpnService(), VpnAdapter {
     } } catch (e: kotlinx.coroutines.CancellationException) {
         throw e
     } catch (e: Exception) {
-        rememberError("Не удалось запустить VPN.")
+        commandLock.withLock { rememberError("Не удалось запустить VPN.") }
         throw e
     } }
 
@@ -207,14 +224,18 @@ class XrayVpnService : VpnService(), VpnAdapter {
             VpnSocketProtector.awaitCleanup()
             VpnSocketProtector.owner()?.takeIf { it !== this }?.cleanupEngine()
             cleanupEngine()
-            if (!keepRunning) rememberCleanup(false)
-            val saved = getSharedPreferences("vpn-state", MODE_PRIVATE)
-            if (saved.getString("error", null) == VPN_CLEANUP_ERROR) rememberError(null)
+            commandLock.withLock {
+                if (!keepRunning) rememberCleanup(false)
+                val saved = getSharedPreferences("vpn-state", MODE_PRIVATE)
+                if (saved.getString("error", null) == VPN_CLEANUP_ERROR) rememberError(null)
+            }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            rememberError(VPN_CLEANUP_ERROR)
-            rememberCleanup(true)
+            commandLock.withLock {
+                rememberError(VPN_CLEANUP_ERROR)
+                rememberCleanup(true)
+            }
             throw e
         }
         if (!keepRunning) {

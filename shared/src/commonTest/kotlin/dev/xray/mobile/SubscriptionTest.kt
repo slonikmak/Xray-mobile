@@ -91,7 +91,7 @@ class SubscriptionTest {
         app.select(first)
         val active = app.state.value.profiles.single()
         vpn.connect(active)
-        vpn.permissionResult(true)
+        vpn.permissionResult(true, requireNotNull(vpn.state.value.sessionId))
         runCurrent()
 
         response = Base64.encode(second.encodeToByteArray())

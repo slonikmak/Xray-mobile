@@ -13,6 +13,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.mutableStateOf
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import io.ktor.client.engine.okhttp.OkHttp
 import java.io.File
 
@@ -21,6 +26,7 @@ class MainActivity : ComponentActivity() {
     private val vpnSession = mutableStateOf<VpnSession?>(null)
     private var bound = false
     private var pendingPermissionResult: Boolean? = null
+    private var permissionSessionId: Long? = null
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             vpnService = (binder as XrayVpnService.LocalBinder).service
@@ -38,6 +44,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState?.containsKey("vpnPermissionSession") == true) {
+            permissionSessionId = savedInstanceState.getLong("vpnPermissionSession")
+        }
         if (savedInstanceState?.containsKey("vpnPermissionResult") == true) {
             pendingPermissionResult = savedInstanceState.getBoolean("vpnPermissionResult")
         }
@@ -49,30 +58,44 @@ class MainActivity : ComponentActivity() {
         }
         val app = SubscriptionApp(HttpSubscriptionSource(engine), AndroidSubscriptionStorage())
         bound = bindService(Intent(this, XrayVpnService::class.java), connection, Context.BIND_AUTO_CREATE)
-        setContent { XrayApp(app, vpnSession.value, ::requestVpn) { vpnService?.cancelOrStop() } }
+        setContent { XrayApp(app, vpnSession.value, ::requestVpn) { lifecycleScope.launch { vpnService?.cancelOrStop() } } }
     }
 
     private fun requestVpn(profile: Profile) {
         val service = vpnService ?: return
-        if (!service.requestConnection(profile)) return
-        try {
-            startForegroundService(Intent(this, XrayVpnService::class.java))
-            val intent = VpnService.prepare(this)
-            if (intent == null) handlePermission(true) else permission.launch(intent)
-        } catch (_: Exception) {
-            service.failPending("Не удалось запросить разрешение VPN.")
+        if (permissionSessionId != null) return
+        lifecycleScope.launch {
+            withContext(NonCancellable) {
+                if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) || permissionSessionId != null) return@withContext
+                val sessionId = service.requestConnection(profile) ?: return@withContext
+                if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                    service.cancelOrStop()
+                    return@withContext
+                }
+                permissionSessionId = sessionId
+                try {
+                    startForegroundService(Intent(this@MainActivity, XrayVpnService::class.java))
+                    val intent = VpnService.prepare(this@MainActivity)
+                    if (intent == null) handlePermission(true) else permission.launch(intent)
+                } catch (_: Exception) {
+                    permissionSessionId = null
+                    service.failPending("Не удалось запросить разрешение VPN.", sessionId)
+                }
+            }
         }
     }
 
     private fun handlePermission(granted: Boolean) {
         val service = vpnService
         if (service == null) { pendingPermissionResult = granted; return }
-        if (service.session.state.value.phase != VpnPhase.PERMISSION) return
-        if (granted) service.session.permissionResult(true) else service.permissionDenied()
+        val sessionId = permissionSessionId ?: return
+        permissionSessionId = null
+        service.handlePermission(granted, sessionId)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         pendingPermissionResult?.let { outState.putBoolean("vpnPermissionResult", it) }
+        permissionSessionId?.let { outState.putLong("vpnPermissionSession", it) }
         super.onSaveInstanceState(outState)
     }
 

@@ -74,7 +74,7 @@ fun XrayApp(app: SubscriptionApp, vpn: VpnSession?, onConnect: (Profile) -> Unit
             ) { padding ->
                 if (connectScreen) ConnectScreen(state, vpnState, vpn != null, Modifier.padding(padding),
                     onChoose = { connectScreen = false }, onConnect = onConnect, onStop = onStop,
-                    onRetry = { profile -> if (vpn?.state?.value?.phase == VpnPhase.CONNECTED) vpn.switchTo(profile) else onConnect(profile) })
+                    onRetry = { profile -> if (vpn?.state?.value?.phase == VpnPhase.CONNECTED) scope.launch { vpn.switchTo(profile) } else onConnect(profile) })
                 else ProfilesScreen(state, vpnState, Modifier.padding(padding),
                     onSelect = { link -> scope.launch {
                         if (app.select(link)) {
