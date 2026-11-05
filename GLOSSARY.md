@@ -24,5 +24,8 @@ A link encoding an individual connection profile, as distinct from a URL used to
 **VPN connection**:
 An active tunnel that carries device application traffic through the selected provider endpoint.
 
+**Local proxy connection**:
+An active desktop Xray session that serves loopback SOCKS5 and HTTP proxies. Only applications explicitly configured to use those proxies send traffic through it; it is distinct from a VPN connection.
+
 **Connection check**:
-A network request used to check reachability through the selected VPN connection. Tunnel state and the result of this check are separate observations.
+A network request used to check reachability through the selected VPN connection or local proxy connection. Engine/process state and the result of this check are separate observations.

@@ -3,6 +3,7 @@ package dev.xray.desktop
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.*
@@ -26,8 +27,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
@@ -41,13 +50,19 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.Tray
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.isTraySupported
 import androidx.compose.ui.window.rememberWindowState
 import org.jetbrains.compose.resources.Font
 import dev.xray.mobile.LineIcon
 import dev.xray.mobile.resources.Res
 import dev.xray.mobile.resources.inter
 import java.awt.Dimension
+import java.awt.Desktop
+import java.awt.desktop.QuitResponse
+import java.awt.desktop.AppReopenedListener
+import javax.swing.SwingUtilities
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
@@ -62,7 +77,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.launch
 
 private val background = Color(0xFF0D1118)
@@ -74,7 +92,9 @@ private val dim = Color(0xFF7E8D9B)
 private val accent = Color(0xFF81EBCD)
 
 fun main() = application {
-    val app by produceState<DesktopRuntime?>(null) {
+    var recoveryAttempt by remember { mutableIntStateOf(0) }
+    val app by produceState<DesktopRuntime?>(null, recoveryAttempt) {
+        value = null
         val opened = withContext(NonCancellable) {
             withContext(Dispatchers.IO) {
                 val storage = try {
@@ -118,24 +138,109 @@ fun main() = application {
         }
     }
     val closeScope = rememberCoroutineScope()
-    var closing by remember { mutableStateOf(false) }
-    Window(onCloseRequest = {
-        if (!closing) {
-            closing = true
-            closeScope.launch {
-                if (app?.proxy?.value?.shutdown() != false) exitApplication() else closing = false
+    val nativeQuit = remember { mutableStateOf<QuitResponse?>(null) }
+    val stoppingFocus = remember { FocusRequester() }
+    val lifecycle = remember { DesktopLifecycle({ app?.proxy?.value }, closeScope, isTraySupported,
+        readyToExit = {
+            withTimeoutOrNull(5_000) {
+                val current = snapshotFlow { app }.filterNotNull().first()
+                if (!current.recoveryAvailable) false else { current.proxy.filterNotNull().first(); true }
+            } ?: false
+        },
+        onExitFailed = { nativeQuit.value?.cancelQuit(); nativeQuit.value = null },
+        exitApplication = {
+            val response = nativeQuit.value
+            nativeQuit.value = null
+            if (response == null) exitApplication() else response.performQuit()
+        }) }
+    DisposableEffect(lifecycle) {
+        val desktop = if (Desktop.isDesktopSupported()) Desktop.getDesktop() else null
+        val reopen = AppReopenedListener { SwingUtilities.invokeLater(lifecycle::openWindow) }
+        if (desktop?.isSupported(Desktop.Action.APP_EVENT_REOPENED) == true) desktop.addAppEventListener(reopen)
+        if (desktop?.isSupported(Desktop.Action.APP_QUIT_HANDLER) == true) {
+            desktop.setQuitHandler { _, response ->
+                SwingUtilities.invokeLater {
+                    if (nativeQuit.value != null) response.cancelQuit()
+                    else { nativeQuit.value = response; lifecycle.exit() }
+                }
             }
         }
-    }, title = "Xray", state = rememberWindowState(width = 360.dp, height = 600.dp)) {
+        onDispose {
+            if (desktop?.isSupported(Desktop.Action.APP_EVENT_REOPENED) == true) desktop.removeAppEventListener(reopen)
+            if (desktop?.isSupported(Desktop.Action.APP_QUIT_HANDLER) == true) desktop.setQuitHandler(null)
+        }
+    }
+    val windowState by lifecycle.state.collectAsState()
+    val current = app
+    val proxy = current?.proxy?.collectAsState()?.value
+    val state = proxy?.state?.collectAsState()?.value
+    val recovering = current != null && proxy == null
+    val trayStatus = when {
+        current == null -> "Opening profiles"
+        recovering -> "Recovering session"
+        state?.phase == ProxyPhase.CONNECTED && state.health == ProxyHealth.REACHABLE -> "Connected"
+        state == null || state.phase == ProxyPhase.DISCONNECTED -> "Disconnected"
+        state.phase == ProxyPhase.STARTING -> "Starting"
+        state.phase == ProxyPhase.STOPPING -> "Stopping"
+        else -> "Attention"
+    }
+    val trayColor = when (trayStatus) {
+        "Connected" -> accent
+        "Disconnected" -> muted
+        else -> Color(0xFFF1C27B)
+    }
+    val trayAction = when {
+        state?.phase == ProxyPhase.STARTING -> "Cancel startup"
+        state?.cleanupRequired == true -> "Retry stop"
+        state?.phase in setOf(ProxyPhase.RUNNING, ProxyPhase.CONNECTED) -> "Disconnect"
+        else -> null
+    }
+    if (isTraySupported) Tray(icon = trayPainter(trayColor), tooltip = "Xray · $trayStatus", onAction = lifecycle::openWindow) {
+        Item("Xray · $trayStatus", enabled = false, onClick = {})
+        Item("Open Xray", onClick = lifecycle::openWindow)
+        if (trayAction != null) Item(trayAction, enabled = !windowState.exiting, onClick = { closeScope.launch { proxy?.disconnect() } })
+        Separator()
+        Item("Exit", enabled = !windowState.exiting, onClick = lifecycle::exit)
+    }
+    Window(onCloseRequest = lifecycle::closeWindow, visible = windowState.visible, title = "Xray",
+        state = rememberWindowState(width = 360.dp, height = 600.dp)) {
         SideEffect { window.minimumSize = Dimension(360, 600) }
-        val current = app
-        if (current == null || closing) Box(Modifier.fillMaxSize().background(background), contentAlignment = Alignment.Center) {
-            Text(if (closing) "Stopping Xray…" else "Opening profiles…", color = muted)
+        if (current == null) Box(Modifier.fillMaxSize().background(background), contentAlignment = Alignment.Center) {
+            Text("Opening profiles…", color = muted)
         } else {
-            val proxy by current.proxy.collectAsState()
             val recoveryFailed by current.recoveryFailed.collectAsState()
-            DesktopApp(current.profiles, proxySession = proxy, recoveryPending = current.recoveryAvailable && proxy == null,
-                recoveryFailed = recoveryFailed)
+            Box(Modifier.fillMaxSize()) {
+                DesktopApp(current.profiles, proxySession = proxy, recoveryPending = proxy == null,
+                    recoveryFailed = recoveryFailed, recoveryUnavailable = current.storage !is MacProfileStorage || !current.recoveryAvailable,
+                    recoveryRetryable = current.storage !is MacProfileStorage,
+                    retryRecovery = { recoveryAttempt++ }, exitWithoutRecovery = {
+                        if (!lifecycle.state.value.exiting) {
+                            if (app?.proxy?.value == null) {
+                                val response = nativeQuit.value
+                                nativeQuit.value = null
+                                if (response == null) exitApplication() else response.performQuit()
+                            } else lifecycle.exit()
+                        }
+                    })
+                if (windowState.exiting && windowState.visible) {
+                    Box(Modifier.fillMaxSize().background(background).focusRequester(stoppingFocus)
+                        .onPreviewKeyEvent { true }.focusable().clickable { }, contentAlignment = Alignment.Center) {
+                        Text("Stopping Xray…", color = muted)
+                    }
+                    LaunchedEffect(Unit) { stoppingFocus.requestFocus() }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun trayPainter(color: Color): Painter = remember(color) {
+    object : Painter() {
+        override val intrinsicSize = Size(22f, 22f)
+        override fun DrawScope.onDraw() {
+            drawCircle(color, radius = size.minDimension * 0.32f, style = Stroke(width = 2f))
+            drawLine(color, Offset(center.x, size.height * 0.18f), Offset(center.x, size.height * 0.55f), 2f, StrokeCap.Round)
         }
     }
 }
@@ -152,7 +257,9 @@ private enum class Screen { Home, Profiles, Details, Import }
 
 @Composable
 fun DesktopApp(app: ProfileApp, subscriptionSource: SubscriptionSource? = null, proxySession: ProxySession? = null,
-    recoveryPending: Boolean = false, recoveryFailed: Boolean = false) {
+    recoveryPending: Boolean = false, recoveryFailed: Boolean = false, recoveryUnavailable: Boolean = false,
+    recoveryRetryable: Boolean = true,
+    retryRecovery: () -> Unit = {}, exitWithoutRecovery: () -> Unit = {}) {
     val uiScope = rememberCoroutineScope()
     val proxyState = proxySession?.state?.collectAsState()?.value ?: if (recoveryPending)
         ProxyState(phase = ProxyPhase.FAILED, error = "Previous session cleanup is not confirmed", cleanupRequired = true) else ProxyState()
@@ -208,8 +315,14 @@ fun DesktopApp(app: ProfileApp, subscriptionSource: SubscriptionSource? = null, 
                     })
                 }
                 (error ?: profiles.error)?.let { Label(it, font, 11, Color(0xFFC89494)) }
-                if (recoveryPending) Label(if (recoveryFailed) "Could not recover the previous session. Retrying; check runtime files and permissions."
+                if (recoveryUnavailable) {
+                    Label(if (recoveryRetryable) "Protected storage is unavailable; previous session cleanup is not confirmed."
+                        else "Bundled runtime is unavailable; previous session cleanup is not confirmed. Restart the packaged app to recover.", font, 11, muted)
+                    if (recoveryRetryable) TextButton(onClick = retryRecovery) { Text("Retry recovery") }
+                }
+                if (recoveryPending && !recoveryUnavailable) Label(if (recoveryFailed) "Could not recover the previous session. Retrying; check runtime files and permissions."
                     else "Checking the previous Xray session…", font, 11, muted)
+                if (recoveryPending && (recoveryFailed || recoveryUnavailable)) TextButton(onClick = exitWithoutRecovery) { Text("Exit without recovery") }
             }
         }
     }
@@ -225,7 +338,7 @@ private fun ColumnScope.Home(font: FontFamily, selected: ProfileInfo?, active: P
         ProxyPhase.DISCONNECTED -> "Disconnected"
         ProxyPhase.STARTING -> "Starting"
         ProxyPhase.RUNNING -> if (proxy.health in setOf(ProxyHealth.CHECKING, ProxyHealth.RETRYING)) "Checking" else "Attention"
-        ProxyPhase.CONNECTED -> "Connected"
+        ProxyPhase.CONNECTED -> if (proxy.health == ProxyHealth.RETRYING) "Connected · check failed" else "Connected"
         ProxyPhase.STOPPING -> "Stopping"
         ProxyPhase.FAILED -> "Attention"
     }

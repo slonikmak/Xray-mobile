@@ -9,7 +9,6 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 
@@ -44,6 +43,7 @@ interface ProxyProcess {
 private sealed interface ProxyEvent {
     data class Connect(val id: String, val reply: CompletableDeferred<Boolean>) : ProxyEvent
     data class Disconnect(val reply: CompletableDeferred<Boolean>) : ProxyEvent
+    data class Shutdown(val reply: CompletableDeferred<Boolean>) : ProxyEvent
     data class Started(val generation: Long, val process: ProxyProcess?, val failed: Boolean) : ProxyEvent
     data class Checked(val generation: Long, val reachable: Boolean) : ProxyEvent
     data class Exited(val generation: Long, val confirmed: Boolean) : ProxyEvent
@@ -60,6 +60,14 @@ class ProxySession(private val backend: ProxyBackend, private val scope: Corouti
         var checkJob: Job? = null
         var startingCancellation: StartupCancellation? = null
         var consecutiveFailures = 0
+        var shuttingDown = false
+        val shutdownReplies = mutableListOf<CompletableDeferred<Boolean>>()
+
+        fun finishShutdown(success: Boolean) {
+            if (!success) shuttingDown = false
+            shutdownReplies.forEach { it.complete(success) }
+            shutdownReplies.clear()
+        }
 
         fun stop(process: ProxyProcess, token: Long, unexpected: Boolean) {
             scope.launch {
@@ -75,7 +83,7 @@ class ProxySession(private val backend: ProxyBackend, private val scope: Corouti
 
         for (event in events) when (event) {
             is ProxyEvent.Connect -> {
-                val accepted = active == null && !mutableState.value.cleanupRequired &&
+                val accepted = !shuttingDown && active == null && !mutableState.value.cleanupRequired &&
                     mutableState.value.phase in setOf(ProxyPhase.DISCONNECTED, ProxyPhase.FAILED)
                 if (accepted) {
                     val token = ++generation
@@ -97,7 +105,10 @@ class ProxySession(private val backend: ProxyBackend, private val scope: Corouti
             is ProxyEvent.Started -> if (event.generation == generation && mutableState.value.phase in setOf(ProxyPhase.STARTING, ProxyPhase.STOPPING)) {
                 val cancelled = mutableState.value.phase == ProxyPhase.STOPPING
                 startingCancellation = null
-                if (event.process == null) mutableState.value = if (cancelled) ProxyState() else ProxyState(phase = ProxyPhase.FAILED, error = "Could not start Xray")
+                if (event.process == null) {
+                    mutableState.value = if (cancelled) ProxyState() else ProxyState(phase = ProxyPhase.FAILED, error = "Could not start Xray")
+                    if (cancelled && shuttingDown) finishShutdown(true)
+                }
                 else {
                     active = event.process
                     if (cancelled) {
@@ -145,6 +156,26 @@ class ProxySession(private val backend: ProxyBackend, private val scope: Corouti
                 }
                 event.reply.complete(accepted)
             }
+            is ProxyEvent.Shutdown -> {
+                if (shuttingDown && shutdownReplies.isEmpty()) event.reply.complete(true)
+                else {
+                    shuttingDown = true
+                    shutdownReplies.add(event.reply)
+                    when {
+                        mutableState.value.phase == ProxyPhase.STARTING -> {
+                            startingCancellation?.cancel()
+                            mutableState.value = mutableState.value.copy(phase = ProxyPhase.STOPPING, health = ProxyHealth.UNKNOWN)
+                        }
+                        mutableState.value.phase == ProxyPhase.STOPPING -> Unit
+                        active != null -> {
+                            checkJob?.cancel()
+                            mutableState.value = mutableState.value.copy(phase = ProxyPhase.STOPPING, health = ProxyHealth.UNKNOWN, error = null)
+                            stop(requireNotNull(active), ++generation, unexpected = false)
+                        }
+                        else -> finishShutdown(true)
+                    }
+                }
+            }
             is ProxyEvent.Exited -> if (event.generation == generation && active != null &&
                 (mutableState.value.phase in setOf(ProxyPhase.RUNNING, ProxyPhase.CONNECTED) ||
                     (mutableState.value.phase == ProxyPhase.FAILED && mutableState.value.cleanupRequired))) {
@@ -161,6 +192,7 @@ class ProxySession(private val backend: ProxyBackend, private val scope: Corouti
                     active = null
                     mutableState.value = if (event.unexpected) ProxyState(phase = ProxyPhase.FAILED, error = "Xray exited") else ProxyState()
                 } else mutableState.value = mutableState.value.copy(phase = ProxyPhase.FAILED, error = "Could not stop and clean up Xray", cleanupRequired = true)
+                if (shuttingDown) finishShutdown(event.success)
             }
         }
     }.also { it.invokeOnCompletion { events.cancel() } }
@@ -177,10 +209,8 @@ class ProxySession(private val backend: ProxyBackend, private val scope: Corouti
     }
 
     suspend fun shutdown(): Boolean {
-        if (state.value.phase == ProxyPhase.STARTING) disconnect()
-        val current = state.first { it.phase != ProxyPhase.STOPPING }
-        if (current.activeProfileId == null) return true
-        if (!disconnect()) return false
-        return state.first { it.phase != ProxyPhase.STOPPING }.activeProfileId == null
+        val reply = CompletableDeferred<Boolean>()
+        if (events.trySend(ProxyEvent.Shutdown(reply)).isFailure) return false
+        return select { reply.onAwait { it }; loop.onJoin { false } }
     }
 }

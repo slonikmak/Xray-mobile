@@ -3,6 +3,7 @@ package dev.xray.desktop
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsSelected
@@ -39,6 +40,26 @@ class DesktopAppTest {
 
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun unavailableRecoveryCanBeRetriedWithoutClaimingStopped() {
+        var retried = false
+        compose.setContent { DesktopApp(unavailableApp, recoveryPending = true, recoveryUnavailable = true, retryRecovery = { retried = true }) }
+        compose.onNodeWithText("Unconfirmed").assertIsDisplayed()
+        compose.onNodeWithText("Retry recovery").performClick()
+        kotlin.test.assertTrue(retried)
+    }
+
+    @Test
+    fun missingRuntimeRequestsRestartInsteadOfOfferingIneffectiveRetry() {
+        var exited = false
+        compose.setContent { DesktopApp(unavailableApp, recoveryPending = true, recoveryUnavailable = true, recoveryRetryable = false,
+            exitWithoutRecovery = { exited = true }) }
+        compose.onNodeWithText("Bundled runtime is unavailable; previous session cleanup is not confirmed. Restart the packaged app to recover.").assertIsDisplayed()
+        compose.onAllNodesWithText("Retry recovery").assertCountEquals(0)
+        compose.onNodeWithText("Exit without recovery").performClick()
+        kotlin.test.assertTrue(exited)
+    }
 
     @Test
     fun recoveryDoesNotClaimStoppedOrAllowProfileDeletion() {

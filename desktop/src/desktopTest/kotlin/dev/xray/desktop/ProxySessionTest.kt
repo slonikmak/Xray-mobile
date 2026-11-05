@@ -2,6 +2,7 @@ package dev.xray.desktop
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -15,6 +16,26 @@ import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProxySessionTest {
+    @Test
+    fun shutdownSerializesWithQueuedConnectAndRejectsLaterConnects() = runTest {
+        val child = FakeProcess()
+        val session = ProxySession(object : ProxyBackend {
+            override suspend fun start(profileId: String, cancellation: StartupCancellation): ProxyProcess = child
+            override suspend fun check() = true
+        }, backgroundScope)
+        val connecting = async(start = CoroutineStart.UNDISPATCHED) { session.connect("profile") }
+        val shuttingDown = async(start = CoroutineStart.UNDISPATCHED) { session.shutdown() }
+        runCurrent()
+        assertTrue(connecting.await())
+        assertFalse(shuttingDown.isCompleted)
+        assertTrue(child.stopRequested)
+        child.exited.complete(Unit)
+        runCurrent()
+        assertTrue(shuttingDown.await())
+        assertTrue(child.cleaned)
+        assertFalse(session.connect("late"))
+    }
+
     @Test
     fun unexpectedExitCleansUpBeforeReconnect() = runTest {
         val first = FakeProcess()
