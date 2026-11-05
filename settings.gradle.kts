@@ -8,4 +8,4 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "Xray"
-include(":app", ":shared")
+include(":app", ":shared", ":desktop")

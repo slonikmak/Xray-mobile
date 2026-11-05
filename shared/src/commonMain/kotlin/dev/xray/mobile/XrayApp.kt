@@ -265,11 +265,28 @@ private fun NavItem(icon: String, label: String, selected: Boolean, onClick: () 
 }
 
 @Composable
-internal fun LineIcon(name: String, color: Color, iconSize: Int = 20) {
+fun LineIcon(name: String, color: Color, iconSize: Int = 20) {
     Canvas(Modifier.size(iconSize.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
             when (name) {
+                "info" -> {
+                    drawCircle(color, 10f, Offset(12f, 12f), style = stroke)
+                    drawCircle(color, 1f, Offset(12f, 8f))
+                    drawLine(color, Offset(12f, 11f), Offset(12f, 16f), strokeWidth = 1.8f, cap = StrokeCap.Round)
+                }
+                "arrow-left" -> {
+                    val arrow = Path().apply { moveTo(12f, 19f); lineTo(5f, 12f); lineTo(12f, 5f); moveTo(5f, 12f); lineTo(19f, 12f) }
+                    drawPath(arrow, color, style = stroke)
+                }
+                "check" -> {
+                    val check = Path().apply { moveTo(5f, 12f); lineTo(9f, 16f); lineTo(19f, 6f) }
+                    drawPath(check, color, style = stroke)
+                }
+                "chevron-right" -> {
+                    val chevron = Path().apply { moveTo(9f, 18f); lineTo(15f, 12f); lineTo(9f, 6f) }
+                    drawPath(chevron, color, style = stroke)
+                }
                 "shield" -> {
                     val outline = Path().apply { moveTo(12f, 22f); cubicTo(12f, 22f, 20f, 18f, 20f, 11f); lineTo(20f, 5f); lineTo(12f, 2f); lineTo(4f, 5f); lineTo(4f, 11f); cubicTo(4f, 18f, 12f, 22f, 12f, 22f); close() }
                     val check = Path().apply { moveTo(9f, 12f); lineTo(11f, 14f); lineTo(15f, 10f) }

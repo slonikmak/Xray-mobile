@@ -36,7 +36,10 @@ kotlin {
     }
 }
 
-compose.resources { packageOfResClass = "dev.xray.mobile.resources" }
+compose.resources {
+    packageOfResClass = "dev.xray.mobile.resources"
+    publicResClass = true
+}
 
 // shortcut: Compose 1.7 omits host-test lint dependencies; remove after upgrading Compose.
 tasks.matching { it.name == "generateAndroidHostTestLintModel" || it.name == "lintAnalyzeAndroidHostTest" }.configureEach {
