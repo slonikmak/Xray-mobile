@@ -15,12 +15,14 @@ kotlin {
                 implementation(compose.components.resources)
                 implementation("com.google.code.gson:gson:2.11.0")
                 implementation("net.java.dev.jna:jna-platform:5.17.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
             }
         }
         getByName("desktopTest") {
             dependencies {
                 implementation(kotlin("test"))
                 implementation(compose.desktop.uiTestJUnit4)
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
             }
         }
     }

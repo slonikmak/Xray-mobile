@@ -156,7 +156,7 @@ private fun inspectConfig(config: JsonObject): Pair<JsonObject, ImportPreview> {
 private fun JsonElement?.objectOrNull(): JsonObject? = if (this != null && isJsonObject) asJsonObject else null
 private fun JsonElement?.stringOrNull(): String? = if (this != null && isJsonPrimitive && asJsonPrimitive.isString) asString else null
 
-private fun checkJson(reader: JsonReader, depth: Int) {
+internal fun checkJson(reader: JsonReader, depth: Int) {
     require(depth <= 64)
     when (reader.peek()) {
         JsonToken.BEGIN_OBJECT -> {
