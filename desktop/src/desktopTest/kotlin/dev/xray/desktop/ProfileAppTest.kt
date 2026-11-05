@@ -75,6 +75,19 @@ class ProfileAppTest {
         assertEquals(listOf("Large"), ProfileApp(storage).state.profiles.map { it.name })
     }
 
+    @Test
+    fun activeProfileCannotBeDeleted() {
+        var active: String? = null
+        val app = ProfileApp(MemoryStorage()) { it == active }
+        val profile = app.importProfile("Example", """{"outbounds":[{"protocol":"vless","streamSettings":{}}]}""")
+        active = profile.id
+        assertFailsWith<IllegalStateException> { app.delete(profile.id) }
+        assertEquals(listOf(profile), app.state.profiles)
+        active = null
+        app.delete(profile.id)
+        assertEquals(emptyList(), app.state.profiles)
+    }
+
     private class MemoryStorage : ProfileStorage {
         var bytes: String? = null
         var failWrites = false

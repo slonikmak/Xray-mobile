@@ -23,7 +23,7 @@ interface ProfileStorage {
 
 private data class StoredProfile(val info: ProfileInfo, val outbound: JsonObject)
 
-class ProfileApp(private val storage: ProfileStorage) {
+class ProfileApp(private val storage: ProfileStorage, private val inUse: (String) -> Boolean = { false }) {
     private var records = emptyList<StoredProfile>()
     private var selectedId: String? = null
     private var failedToRestore = false
@@ -81,7 +81,19 @@ class ProfileApp(private val storage: ProfileStorage) {
     @Synchronized
     fun delete(id: String) {
         require(records.any { it.info.id == id }) { "Profile not found" }
+        check(!inUse(id)) { "Cannot delete the active profile" }
         save(records.filterNot { it.info.id == id }, if (selectedId == id) null else selectedId)
+    }
+
+    @Synchronized
+    internal fun runtimeConfig(id: String): ByteArray {
+        check(!failedToRestore) { "Profile storage is unavailable" }
+        val outbound = records.firstOrNull { it.info.id == id }?.outbound ?: throw IllegalArgumentException("Profile not found")
+        val config = JsonParser.parseString(
+            """{"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth","udp":false}},{"tag":"http-in","listen":"127.0.0.1","port":10809,"protocol":"http","settings":{}}],"routing":{"domainStrategy":"AsIs","rules":[{"type":"field","inboundTag":["socks-in","http-in"],"outboundTag":"selected-vless"}]},"log":{"loglevel":"warning"}}"""
+        ).asJsonObject
+        config.add("outbounds", JsonArray().apply { add(outbound.deepCopy()) })
+        return config.toString().toByteArray(Charsets.UTF_8)
     }
 
     private fun save(next: List<StoredProfile>, selection: String?) {

@@ -49,12 +49,19 @@ import dev.xray.mobile.resources.Res
 import dev.xray.mobile.resources.inter
 import java.awt.Dimension
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 
@@ -67,31 +74,88 @@ private val dim = Color(0xFF7E8D9B)
 private val accent = Color(0xFF81EBCD)
 
 fun main() = application {
-    val storage = remember {
-        try {
-            val appData = requireNotNull(System.getenv("LOCALAPPDATA")).takeIf { it.isNotBlank() } ?: error("Missing profile directory")
-            val directory = Path.of(appData).resolve("Xray")
-            require(directory.isAbsolute)
-            WindowsProfileStorage(directory)
-        } catch (_: Exception) {
-            object : ProfileStorage {
-                override fun read(): String? = error("Protected profile storage unavailable")
-                override fun write(value: String) = error("Protected profile storage unavailable")
+    val app by produceState<DesktopRuntime?>(null) {
+        val opened = withContext(NonCancellable) {
+            withContext(Dispatchers.IO) {
+                val storage = try {
+                    val directory = Path.of(System.getProperty("user.home"), "Library", "Application Support", "Xray Multiplatform")
+                    MacProfileStorage(directory)
+                } catch (_: Exception) { unavailableStorage() }
+                catch (_: LinkageError) { unavailableStorage() }
+                val runtimeDirectory = System.getProperty("compose.application.resources.dir")?.let { Path.of(it, "runtime") }
+                val recoveryAvailable = storage is MacProfileStorage && runtimeDirectory != null
+                val recovering = AtomicBoolean(recoveryAvailable)
+                val session = AtomicReference<ProxySession?>()
+                val profiles = ProfileApp(storage) { recovering.get() || session.get()?.state?.value?.activeProfileId == it }
+                val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                val proxy = MutableStateFlow<ProxySession?>(null)
+                val recoveryFailed = MutableStateFlow(false)
+                if (storage is MacProfileStorage && runtimeDirectory != null) {
+                    val backend = MacProxyBackend(profiles, storage, runtimeDirectory.resolve("xray"),
+                        runtimeDirectory.resolve("xray-supervisor"), scope)
+                    scope.launch {
+                        while (isActive) {
+                            try {
+                                backend.recover()
+                                val ready = ProxySession(backend, scope)
+                                session.set(ready)
+                                recovering.set(false)
+                                proxy.value = ready
+                                break
+                            } catch (e: CancellationException) { throw e }
+                            catch (_: Exception) { recoveryFailed.value = true; delay(2_000) }
+                        }
+                    }
+                }
+                DesktopRuntime(profiles, proxy, recoveryAvailable, recoveryFailed, scope, storage)
             }
         }
+        try {
+            value = opened
+            awaitCancellation()
+        } finally {
+            withContext(NonCancellable + Dispatchers.IO) { opened.scope.cancel(); (opened.storage as? AutoCloseable)?.close() }
+        }
     }
-    val app = remember { ProfileApp(storage) }
-    DisposableEffect(storage) { onDispose { (storage as? AutoCloseable)?.close() } }
-    Window(onCloseRequest = ::exitApplication, title = "Xray", state = rememberWindowState(width = 360.dp, height = 600.dp)) {
+    val closeScope = rememberCoroutineScope()
+    var closing by remember { mutableStateOf(false) }
+    Window(onCloseRequest = {
+        if (!closing) {
+            closing = true
+            closeScope.launch {
+                if (app?.proxy?.value?.shutdown() != false) exitApplication() else closing = false
+            }
+        }
+    }, title = "Xray", state = rememberWindowState(width = 360.dp, height = 600.dp)) {
         SideEffect { window.minimumSize = Dimension(360, 600) }
-        DesktopApp(app)
+        val current = app
+        if (current == null || closing) Box(Modifier.fillMaxSize().background(background), contentAlignment = Alignment.Center) {
+            Text(if (closing) "Stopping Xray…" else "Opening profiles…", color = muted)
+        } else {
+            val proxy by current.proxy.collectAsState()
+            val recoveryFailed by current.recoveryFailed.collectAsState()
+            DesktopApp(current.profiles, proxySession = proxy, recoveryPending = current.recoveryAvailable && proxy == null,
+                recoveryFailed = recoveryFailed)
+        }
     }
+}
+
+private data class DesktopRuntime(val profiles: ProfileApp, val proxy: MutableStateFlow<ProxySession?>,
+    val recoveryAvailable: Boolean, val recoveryFailed: MutableStateFlow<Boolean>, val scope: CoroutineScope, val storage: ProfileStorage)
+
+private fun unavailableStorage() = object : ProfileStorage {
+    override fun read(): String? = error("Protected profile storage unavailable")
+    override fun write(value: String) = error("Protected profile storage unavailable")
 }
 
 private enum class Screen { Home, Profiles, Details, Import }
 
 @Composable
-fun DesktopApp(app: ProfileApp, subscriptionSource: SubscriptionSource? = null) {
+fun DesktopApp(app: ProfileApp, subscriptionSource: SubscriptionSource? = null, proxySession: ProxySession? = null,
+    recoveryPending: Boolean = false, recoveryFailed: Boolean = false) {
+    val uiScope = rememberCoroutineScope()
+    val proxyState = proxySession?.state?.collectAsState()?.value ?: if (recoveryPending)
+        ProxyState(phase = ProxyPhase.FAILED, error = "Previous session cleanup is not confirmed", cleanupRequired = true) else ProxyState()
     val previewScope = remember(app, subscriptionSource) { CoroutineScope(SupervisorJob() + Dispatchers.Default) }
     val previews = remember(app, subscriptionSource) { SubscriptionPreviews(app, subscriptionSource ?: HttpSubscriptionSource(), previewScope) }
     DisposableEffect(previews) { onDispose { previews.clear(); previewScope.cancel() } }
@@ -125,11 +189,17 @@ fun DesktopApp(app: ProfileApp, subscriptionSource: SubscriptionSource? = null) 
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 when (screen) {
-                    Screen.Home -> Home(font, selected, { navigate(Screen.Profiles) }, { navigate(Screen.Details) })
+                    Screen.Home -> Home(font, selected, profiles.profiles.firstOrNull { it.id == proxyState.activeProfileId }, proxyState,
+                        proxySession != null, { navigate(Screen.Profiles) }, { navigate(Screen.Details) }) {
+                        if (proxySession != null) uiScope.launch {
+                            if (proxyState.phase in setOf(ProxyPhase.STARTING, ProxyPhase.RUNNING, ProxyPhase.CONNECTED) || proxyState.cleanupRequired) proxySession.disconnect()
+                            else selected?.let { proxySession.connect(it.id) }
+                        }
+                    }
                     Screen.Profiles -> Profiles(font, profiles, { navigate(Screen.Home) }, { navigate(Screen.Import) }) { id ->
                         if (runCommand { app.select(id) }) navigate(Screen.Home)
                     }
-                    Screen.Details -> Details(font, profiles, selected, error, { error = null }, { navigate(Screen.Home) }, { navigate(Screen.Import) },
+                    Screen.Details -> Details(font, profiles, selected, proxyState, proxySession != null, recoveryPending, error, { error = null }, { navigate(Screen.Home) }, { navigate(Screen.Import) },
                         { id, name -> runCommand { app.rename(id, name) } }, { id -> runCommand { app.delete(id) } })
                     Screen.Import -> ImportScreen(font, previews, { error = null }, { navigate(Screen.Profiles) }, { name, input ->
                         if (runCommand { app.importProfile(name, input) }) { navigate(Screen.Profiles); true } else false
@@ -138,38 +208,96 @@ fun DesktopApp(app: ProfileApp, subscriptionSource: SubscriptionSource? = null) 
                     })
                 }
                 (error ?: profiles.error)?.let { Label(it, font, 11, Color(0xFFC89494)) }
+                if (recoveryPending) Label(if (recoveryFailed) "Could not recover the previous session. Retrying; check runtime files and permissions."
+                    else "Checking the previous Xray session…", font, 11, muted)
             }
         }
     }
 }
 
 @Composable
-private fun ColumnScope.Home(font: FontFamily, selected: ProfileInfo?, profiles: () -> Unit, details: () -> Unit) {
+private fun ColumnScope.Home(font: FontFamily, selected: ProfileInfo?, active: ProfileInfo?, proxy: ProxyState, available: Boolean,
+    profiles: () -> Unit, details: () -> Unit, onPower: () -> Unit) {
+    val running = proxy.phase == ProxyPhase.RUNNING || proxy.phase == ProxyPhase.CONNECTED
+    val canStop = running || proxy.phase == ProxyPhase.STARTING || proxy.cleanupRequired
+    val powerEnabled = available && (canStop || (selected != null && proxy.phase in setOf(ProxyPhase.DISCONNECTED, ProxyPhase.FAILED)))
+    val status = when (proxy.phase) {
+        ProxyPhase.DISCONNECTED -> "Disconnected"
+        ProxyPhase.STARTING -> "Starting"
+        ProxyPhase.RUNNING -> if (proxy.health in setOf(ProxyHealth.CHECKING, ProxyHealth.RETRYING)) "Checking" else "Attention"
+        ProxyPhase.CONNECTED -> "Connected"
+        ProxyPhase.STOPPING -> "Stopping"
+        ProxyPhase.FAILED -> "Attention"
+    }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
         Box(Modifier.background(Color(0xFF151C25), CircleShape).border(1.dp, border, CircleShape).padding(horizontal = 8.dp, vertical = 4.dp)) {
-            Label("●  Disconnected", font, 10, muted)
+            Label("●  $status", font, 10, if (proxy.phase == ProxyPhase.CONNECTED) accent else muted)
         }
         SmallButton("Details", "info", details)
     }
-    ActionCard(selected?.name ?: "No profile selected", if (selected == null) "Choose a profile" else "Xray configuration", font, onClick = profiles)
+    ActionCard(active?.name ?: selected?.name ?: "No profile selected", when {
+        active != null -> "Active profile"
+        selected != null -> "Xray configuration"
+        else -> "Choose a profile"
+    }, font, onClick = profiles)
     Column(Modifier.fillMaxWidth().weight(1f).padding(vertical = 24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Box(Modifier.size(96.dp), contentAlignment = Alignment.Center) {
             Box(Modifier.size(88.dp).border(1.dp, border, CircleShape))
-            Box(Modifier.size(72.dp).background(card, CircleShape).border(1.dp, border, CircleShape), contentAlignment = Alignment.Center) {
-                Box(Modifier.semantics { contentDescription = "Connection unavailable" }) { LineIcon("power", muted, 26) }
+            Box(Modifier.size(72.dp).background(if (proxy.phase == ProxyPhase.CONNECTED) accent else card, CircleShape)
+                .border(1.dp, border, CircleShape).clickable(enabled = powerEnabled, role = Role.Button, onClick = onPower)
+                .semantics { contentDescription = if (!available) "Connection unavailable" else if (proxy.cleanupRequired) "Retry stop" else if (proxy.phase == ProxyPhase.STARTING) "Cancel startup" else if (canStop) "Disconnect" else "Connect" },
+                contentAlignment = Alignment.Center) {
+                LineIcon("power", if (proxy.phase == ProxyPhase.CONNECTED) Color(0xFF102D26) else muted, 26)
             }
         }
         Spacer(Modifier.height(12.dp))
-        Label("Proxy is off", font, 20, foreground, FontWeight.SemiBold)
+        val heading = when (proxy.phase) {
+            ProxyPhase.STARTING -> "Starting proxy"
+            ProxyPhase.RUNNING, ProxyPhase.CONNECTED -> "Proxy is running"
+            ProxyPhase.STOPPING -> "Stopping proxy"
+            ProxyPhase.FAILED -> "Proxy error"
+            ProxyPhase.DISCONNECTED -> "Proxy is off"
+        }
+        Label(heading, font, 20, foreground, FontWeight.SemiBold)
         Spacer(Modifier.height(6.dp))
-        Label("No local proxy is running", font, 10, dim)
+        val subtitle = when {
+            running -> "SOCKS5 127.0.0.1:10808 · HTTP 127.0.0.1:10809"
+            proxy.phase == ProxyPhase.STARTING -> "Starting Xray"
+            proxy.phase == ProxyPhase.STOPPING -> "Waiting for cleanup"
+            proxy.cleanupRequired -> "Stop is not confirmed"
+            else -> "No local proxy is running"
+        }
+        Label(subtitle, font, 10, dim)
     }
     Row(Modifier.fillMaxWidth().drawBehind { drawLine(border, Offset.Zero, Offset(size.width, 0f), 1.dp.toPx()) }.padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        StateItem("Xray process", "Not running", font, Modifier.weight(1f))
+        val processText = when {
+            running -> "Running"
+            proxy.phase == ProxyPhase.STARTING -> "Starting"
+            proxy.phase == ProxyPhase.STOPPING -> "Stopping"
+            proxy.cleanupRequired -> "Unconfirmed"
+            else -> "Not running"
+        }
+        val healthText = when (proxy.health) {
+            ProxyHealth.UNKNOWN -> "Not verified"
+            ProxyHealth.CHECKING -> "Checking"
+            ProxyHealth.RETRYING -> "Failed · retry pending"
+            ProxyHealth.REACHABLE -> "Reachable"
+            ProxyHealth.FAILED -> "Failed"
+        }
+        StateItem("Xray process", processText, font, Modifier.weight(1f))
         Box(Modifier.width(1.dp).height(32.dp).background(border))
-        StateItem("Network check", "Not verified", font, Modifier.weight(1f))
+        StateItem("Network check", healthText, font, Modifier.weight(1f))
     }
-    Label("Local proxy is stopped", font, 10, dim, modifier = Modifier.fillMaxWidth(), align = TextAlign.Center)
+    Label(proxy.error ?: when {
+        proxy.health == ProxyHealth.REACHABLE -> "HTTP proxy check passed; other destinations may differ"
+        proxy.health == ProxyHealth.RETRYING -> "Latest check failed; retry scheduled"
+        proxy.health == ProxyHealth.FAILED -> "Proxy check failed"
+        running -> "Proxy check has not succeeded"
+        proxy.phase == ProxyPhase.STARTING -> "Starting local proxy"
+        proxy.phase == ProxyPhase.STOPPING -> "Stopping local proxy"
+        else -> "Local proxy is stopped"
+    }, font, 10, dim,
+        modifier = Modifier.fillMaxWidth(), align = TextAlign.Center)
 }
 
 @Composable
@@ -199,26 +327,32 @@ private fun ColumnScope.Profiles(font: FontFamily, state: ProfileState, back: ()
 }
 
 @Composable
-private fun ColumnScope.Details(font: FontFamily, state: ProfileState, selected: ProfileInfo?, error: String?, clearError: () -> Unit, back: () -> Unit, onImport: () -> Unit,
+private fun ColumnScope.Details(font: FontFamily, state: ProfileState, selected: ProfileInfo?, proxy: ProxyState, available: Boolean, recoveryPending: Boolean, error: String?, clearError: () -> Unit, back: () -> Unit, onImport: () -> Unit,
     rename: (String, String) -> Boolean, delete: (String) -> Boolean) {
     var renaming by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
     var name by remember(selected?.id) { mutableStateOf(selected?.name.orEmpty()) }
     Header("Details", font, back)
     Label("Local endpoints", font, 10, dim)
-    StaticCard("No local proxy is running", font)
+    StaticCard(when (proxy.phase) {
+        ProxyPhase.RUNNING, ProxyPhase.CONNECTED -> "SOCKS5 127.0.0.1:10808 · HTTP 127.0.0.1:10809"
+        ProxyPhase.STARTING -> "Starting local proxy"
+        ProxyPhase.STOPPING -> "Stopping local proxy"
+        ProxyPhase.FAILED -> if (proxy.cleanupRequired) "Proxy stop is not confirmed" else "No local proxy is running"
+        ProxyPhase.DISCONNECTED -> "No local proxy is running"
+    }, font)
     Label("Only apps configured to use a proxy are routed.", font, 10, dim)
     Label("Profile", font, 10, dim)
     StaticCard(selected?.name ?: "No profile selected", font)
     if (selected != null) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = { clearError(); renaming = true }) { Text("Rename") }
-            TextButton(onClick = { clearError(); deleting = true }) { Text("Delete") }
+            TextButton(onClick = { clearError(); deleting = true }, enabled = !recoveryPending && selected.id != proxy.activeProfileId) { Text("Delete") }
         }
     }
     if (state.error == null) ActionButton("Import profile", font, onImport) else DisabledCard("Import profile", font)
     Label("Runtime", font, 10, dim)
-    StaticCard("Runtime not available", font)
+    StaticCard(if (available) "Xray 26.10.31" else "Runtime not available", font)
     DisabledCard("Diagnostics", font)
     if (selected != null && renaming) AlertDialog(
         onDismissRequest = { renaming = false; clearError() }, title = { Text("Rename profile") },

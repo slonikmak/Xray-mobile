@@ -18,6 +18,10 @@ import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextReplacement
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import androidx.compose.ui.test.hasSetTextAction
@@ -35,6 +39,47 @@ class DesktopAppTest {
 
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun recoveryDoesNotClaimStoppedOrAllowProfileDeletion() {
+        val app = ProfileApp(object : ProfileStorage {
+            override fun read(): String? = null
+            override fun write(value: String) = Unit
+        })
+        val profile = app.importProfile("Example", """{"outbounds":[{"protocol":"vless","streamSettings":{}}]}""")
+        app.select(profile.id)
+        compose.setContent { DesktopApp(app, recoveryPending = true, recoveryFailed = true) }
+        compose.onNodeWithText("Unconfirmed").assertIsDisplayed()
+        compose.onNodeWithText("Could not recover the previous session. Retrying; check runtime files and permissions.").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Details").performClick()
+        compose.onNodeWithText("Delete").assertIsNotEnabled()
+        compose.onNodeWithText("Proxy stop is not confirmed").assertIsDisplayed()
+    }
+
+    @Test
+    fun firstFailedCheckIsVisibleWhileWaitingForRetry() {
+        val app = ProfileApp(object : ProfileStorage {
+            override fun read(): String? = null
+            override fun write(value: String) = Unit
+        })
+        val profile = app.importProfile("Example", """{"outbounds":[{"protocol":"vless","streamSettings":{}}]}""")
+        app.select(profile.id)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val session = ProxySession(object : ProxyBackend {
+            override suspend fun start(profileId: String, cancellation: StartupCancellation) = object : ProxyProcess {
+                override suspend fun awaitExit(): Unit = kotlinx.coroutines.awaitCancellation()
+                override suspend fun stop() = Unit
+                override suspend fun cleanup() = Unit
+            }
+            override suspend fun check() = false
+        }, scope)
+        try {
+            compose.setContent { DesktopApp(app, proxySession = session) }
+            compose.onNodeWithContentDescription("Connect").performClick()
+            compose.waitUntil(5_000) { compose.onAllNodes(hasText("Failed · retry pending")).fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("Latest check failed; retry scheduled").assertIsDisplayed()
+        } finally { scope.cancel() }
+    }
 
     @Test
     fun userCanNavigateEmptyScreens() {
@@ -251,6 +296,37 @@ class DesktopAppTest {
         compose.onNodeWithText("Old").assertDoesNotExist()
         compose.onNodeWithText("Cancel loading").performClick()
         release.complete(Unit)
+    }
+
+    @Test
+    fun connectionShowsProcessAndHealthAndCanDisconnect() {
+        val app = ProfileApp(object : ProfileStorage {
+            override fun read(): String? = null
+            override fun write(value: String) = Unit
+        })
+        val profile = app.importProfile("Example", """{"outbounds":[{"protocol":"vless","streamSettings":{}}]}""")
+        app.select(profile.id)
+        val exited = CompletableDeferred<Unit>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val session = ProxySession(object : ProxyBackend {
+            override suspend fun start(profileId: String, cancellation: StartupCancellation) = object : ProxyProcess {
+                override suspend fun awaitExit() { exited.await() }
+                override suspend fun stop() { exited.complete(Unit); exited.await() }
+                override suspend fun cleanup() = Unit
+            }
+            override suspend fun check() = true
+        }, scope)
+        try {
+            compose.setContent { DesktopApp(app, proxySession = session) }
+            compose.onNodeWithContentDescription("Connect").performClick()
+            compose.waitUntil(5_000) { compose.onAllNodes(hasText("Reachable")).fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("Running").assertIsDisplayed()
+            compose.onNodeWithContentDescription("Details").performClick()
+            compose.onNodeWithText("SOCKS5 127.0.0.1:10808 · HTTP 127.0.0.1:10809").assertIsDisplayed()
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.onNodeWithContentDescription("Disconnect").performClick()
+            compose.waitUntil(5_000) { compose.onAllNodes(hasText("Proxy is off")).fetchSemanticsNodes().isNotEmpty() }
+        } finally { scope.cancel() }
     }
 
 }
